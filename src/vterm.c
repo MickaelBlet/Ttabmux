@@ -10,10 +10,24 @@
 
 #include "ttabmux.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wctype.h>
 #include <wchar.h>
+
+/* ------------------------------------------------------------------ */
+/*  Response buffer (written back to PTY by caller)                   */
+/* ------------------------------------------------------------------ */
+
+static void vterm_respond(struct vterm *vt, const char *s, int len)
+{
+    int avail = (int)sizeof(vt->resp_buf) - vt->resp_len;
+    if (len > avail) len = avail;
+    if (len <= 0) return;
+    memcpy(vt->resp_buf + vt->resp_len, s, (size_t)len);
+    vt->resp_len += len;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                           */
@@ -60,6 +74,19 @@ static void scroll_up(struct vterm *vt, int n)
     int bot = vt->scroll_bottom;
     if (n <= 0) return;
     if (n > bot - top + 1) n = bot - top + 1;
+
+    /* Save scrolled-off lines to scrollback (main screen only) */
+    if (top == 0 && !vt->alt_active && vt->scrollback) {
+        int save = n;
+        if (save > vt->rows) save = vt->rows;
+        for (int i = 0; i < save; i++) {
+            memcpy(&vt->scrollback[vt->sb_head * vt->cols],
+                   &vt->cells[i * vt->cols],
+                   (size_t)vt->cols * sizeof(struct cell));
+            vt->sb_head = (vt->sb_head + 1) % SCROLLBACK_MAX;
+            if (vt->sb_len < SCROLLBACK_MAX) vt->sb_len++;
+        }
+    }
 
     /* Move lines up */
     memmove(&vt->cells[top * vt->cols],
@@ -118,6 +145,7 @@ void vterm_init(struct vterm *vt, int rows, int cols)
     vt->cells = calloc((size_t)(rows * cols), sizeof(struct cell));
     vt->alt_cells = calloc((size_t)(rows * cols), sizeof(struct cell));
     vt->tabstops = calloc((size_t)cols, 1);
+    vt->scrollback = calloc((size_t)(SCROLLBACK_MAX * cols), sizeof(struct cell));
 
     for (int i = 0; i < rows * cols; i++) {
         clear_cell(&vt->cells[i]);
@@ -141,14 +169,18 @@ void vterm_free(struct vterm *vt)
     free(vt->cells);
     free(vt->alt_cells);
     free(vt->tabstops);
+    free(vt->scrollback);
     vt->cells = NULL;
     vt->alt_cells = NULL;
     vt->tabstops = NULL;
+    vt->scrollback = NULL;
 }
 
 void vterm_resize(struct vterm *vt, int rows, int cols)
 {
     if (rows == vt->rows && cols == vt->cols) return;
+
+    int old_cols = vt->cols;
 
     struct cell *new_cells     = calloc((size_t)(rows * cols), sizeof(struct cell));
     struct cell *new_alt_cells = calloc((size_t)(rows * cols), sizeof(struct cell));
@@ -202,11 +234,41 @@ void vterm_resize(struct vterm *vt, int rows, int cols)
     vt->scroll_top = 0;
     vt->scroll_bottom = rows - 1;
     vt->wrap_pending = 0;
+
+    /* Scrollback: resize lines when column width changes */
+    if (cols != old_cols) {
+        struct cell *new_sb = calloc((size_t)(SCROLLBACK_MAX * cols), sizeof(struct cell));
+        if (vt->scrollback && vt->sb_len > 0) {
+            int copy_c = (cols < old_cols) ? cols : old_cols;
+            for (int i = 0; i < vt->sb_len; i++) {
+                int old_idx = (vt->sb_head - vt->sb_len + i + SCROLLBACK_MAX) % SCROLLBACK_MAX;
+                struct cell *src = &vt->scrollback[old_idx * old_cols];
+                struct cell *dst = &new_sb[i * cols];
+                for (int c = 0; c < copy_c; c++)
+                    dst[c] = src[c];
+                for (int c = copy_c; c < cols; c++)
+                    clear_cell(&dst[c]);
+            }
+        }
+        free(vt->scrollback);
+        vt->scrollback = new_sb;
+        vt->sb_head = vt->sb_len % SCROLLBACK_MAX;
+    }
+    if (vt->scroll_offset > vt->sb_len)
+        vt->scroll_offset = vt->sb_len;
 }
 
 struct cell *vterm_cell(struct vterm *vt, int row, int col)
 {
     return grid_cell(vt, row, col);
+}
+
+struct cell *vterm_sb_line(struct vterm *vt, int depth)
+{
+    if (depth < 1 || depth > vt->sb_len || !vt->scrollback)
+        return NULL;
+    int idx = (vt->sb_head - depth + SCROLLBACK_MAX) % SCROLLBACK_MAX;
+    return &vt->scrollback[idx * vt->cols];
 }
 
 /* ------------------------------------------------------------------ */
@@ -403,60 +465,78 @@ static void handle_csi(struct vterm *vt)
     int n, m;
 
     if (priv == '?') {
-        /* DEC private modes */
-        int mode = param_or(params, nparam, 0, 0);
-        if (cmd == 'h') {
-            /* Set mode */
-            switch (mode) {
-            case 1:    vt->app_cursor = 1; break;
-            case 7:    vt->auto_wrap = 1; break;
-            case 25:   vt->cursor_visible = 1; break;
-            case 47: case 1047:
-                switch_to_alt(vt);
-                break;
-            case 1048:
-                vt->saved_row = vt->cursor_row;
-                vt->saved_col = vt->cursor_col;
-                break;
-            case 1049:
-                vt->saved_row = vt->cursor_row;
-                vt->saved_col = vt->cursor_col;
-                switch_to_alt(vt);
-                break;
-            case 2004:
-                vt->bracketed_paste = 1;
-                break;
-            }
-        } else if (cmd == 'l') {
-            /* Reset mode */
-            switch (mode) {
-            case 1:    vt->app_cursor = 0; break;
-            case 7:    vt->auto_wrap = 0; break;
-            case 25:   vt->cursor_visible = 0; break;
-            case 47: case 1047:
-                switch_to_main(vt);
-                break;
-            case 1048:
-                vt->cursor_row = vt->saved_row;
-                vt->cursor_col = vt->saved_col;
-                clamp_cursor(vt);
-                break;
-            case 1049:
-                switch_to_main(vt);
-                vt->cursor_row = vt->saved_row;
-                vt->cursor_col = vt->saved_col;
-                clamp_cursor(vt);
-                break;
-            case 2004:
-                vt->bracketed_paste = 0;
-                break;
+        /* DEC private modes — iterate all params (e.g. CSI?1006;1000h) */
+        for (int pi = 0; pi < nparam; pi++) {
+            int mode = param_or(params, nparam, pi, 0);
+            if (cmd == 'h') {
+                /* Set mode */
+                switch (mode) {
+                case 1:    vt->app_cursor = 1; break;
+                case 7:    vt->auto_wrap = 1; break;
+                case 25:   vt->cursor_visible = 1; break;
+                case 47: case 1047:
+                    switch_to_alt(vt);
+                    break;
+                case 1048:
+                    vt->saved_row = vt->cursor_row;
+                    vt->saved_col = vt->cursor_col;
+                    break;
+                case 1049:
+                    vt->saved_row = vt->cursor_row;
+                    vt->saved_col = vt->cursor_col;
+                    switch_to_alt(vt);
+                    break;
+                case 2004:
+                    vt->bracketed_paste = 1;
+                    break;
+                case 1000: case 1002: case 1003:
+                    vt->mouse_mode = mode;
+                    break;
+                }
+            } else if (cmd == 'l') {
+                /* Reset mode */
+                switch (mode) {
+                case 1:    vt->app_cursor = 0; break;
+                case 7:    vt->auto_wrap = 0; break;
+                case 25:   vt->cursor_visible = 0; break;
+                case 47: case 1047:
+                    switch_to_main(vt);
+                    break;
+                case 1048:
+                    vt->cursor_row = vt->saved_row;
+                    vt->cursor_col = vt->saved_col;
+                    clamp_cursor(vt);
+                    break;
+                case 1049:
+                    switch_to_main(vt);
+                    vt->cursor_row = vt->saved_row;
+                    vt->cursor_col = vt->saved_col;
+                    clamp_cursor(vt);
+                    break;
+                case 2004:
+                    vt->bracketed_paste = 0;
+                    break;
+                case 1000: case 1002: case 1003:
+                    vt->mouse_mode = 0;
+                    break;
+                }
             }
         }
         return;
     }
 
-    if (priv == '>' || priv == '!') {
-        /* Ignore these private sequences */
+    if (priv == '>') {
+        /* DA2 - Secondary Device Attributes */
+        if (cmd == 'c') {
+            /* Report as xterm version 300 — tells vim to use ttymouse=sgr */
+            const char *resp = "\033[>65;300;1c";
+            vterm_respond(vt, resp, (int)strlen(resp));
+        }
+        return;
+    }
+
+    if (priv == '!') {
+        /* Ignore */
         return;
     }
 
@@ -645,7 +725,17 @@ static void handle_csi(struct vterm *vt)
         break;
 
     case 'n': /* DSR - Device Status Report */
-        /* We don't respond to DSR (would need to write to PTY) */
+        n = param_or(params, nparam, 0, 0);
+        if (n == 6) {
+            /* CPR - Cursor Position Report */
+            char cpr[32];
+            int clen = snprintf(cpr, sizeof(cpr), "\033[%d;%dR",
+                                vt->cursor_row + 1, vt->cursor_col + 1);
+            vterm_respond(vt, cpr, clen);
+        } else if (n == 5) {
+            /* Status report: terminal OK */
+            vterm_respond(vt, "\033[0n", 4);
+        }
         break;
 
     case 'r': /* DECSTBM - Set Scrolling Region */
@@ -672,8 +762,12 @@ static void handle_csi(struct vterm *vt)
         clamp_cursor(vt);
         break;
 
-    case 'c': /* DA - Device Attributes */
-        /* Ignore */
+    case 'c': /* DA1 - Primary Device Attributes */
+        {
+            /* Report VT220 with ANSI color, national replacement charsets */
+            const char *da1 = "\033[?62;22c";
+            vterm_respond(vt, da1, (int)strlen(da1));
+        }
         break;
 
     case 'g': /* TBC - Tabulation Clear */
@@ -845,6 +939,27 @@ static void vterm_putc(struct vterm *vt, uint32_t ch)
 }
 
 /* ------------------------------------------------------------------ */
+/*  OSC handler                                                       */
+/* ------------------------------------------------------------------ */
+
+static void handle_osc(struct vterm *vt)
+{
+    if (vt->esc_len < 2) return;
+
+    /* OSC 0;text — set icon name + window title */
+    /* OSC 2;text — set window title */
+    if ((vt->esc_buf[0] == '0' || vt->esc_buf[0] == '2') &&
+        vt->esc_buf[1] == ';') {
+        int len = vt->esc_len - 2;
+        if (len > (int)sizeof(vt->title) - 1)
+            len = (int)sizeof(vt->title) - 1;
+        memcpy(vt->title, &vt->esc_buf[2], (size_t)len);
+        vt->title[len] = '\0';
+        vt->title_changed = 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Process input data                                                */
 /* ------------------------------------------------------------------ */
 
@@ -934,16 +1049,17 @@ void vterm_process(struct vterm *vt, const char *data, int len)
         case VT_OSC:
             /* OSC terminated by BEL (0x07) or ST (ESC \) */
             if (ch == 0x07) {
+                handle_osc(vt);
                 vt->state = VT_NORMAL;
             } else if (ch == 0x1B) {
                 /* Might be ST (ESC \), peek at next */
-                vt->state = VT_NORMAL;
-                /* If next char is \, consume it; otherwise reprocess */
                 if (i + 1 < len && data[i + 1] == '\\') {
+                    handle_osc(vt);
                     i++;
                 }
+                vt->state = VT_NORMAL;
             } else {
-                /* Accumulate but don't process OSC content */
+                /* Accumulate OSC content */
                 if (vt->esc_len < MAX_ESC_BUF - 1)
                     vt->esc_buf[vt->esc_len++] = (char)ch;
             }
