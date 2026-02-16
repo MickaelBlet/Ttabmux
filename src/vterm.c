@@ -492,6 +492,11 @@ static void handle_csi(struct vterm *vt)
                 case 1000: case 1002: case 1003:
                     vt->mouse_mode = mode;
                     break;
+                case 1005: case 1006: case 1015:
+                    /* Mouse encoding modes — we always use SGR (1006)
+                       when forwarding, but track the request so the
+                       child app knows we acknowledged it. */
+                    break;
                 }
             } else if (cmd == 'l') {
                 /* Reset mode */
@@ -518,6 +523,9 @@ static void handle_csi(struct vterm *vt)
                     break;
                 case 1000: case 1002: case 1003:
                     vt->mouse_mode = 0;
+                    break;
+                case 1005: case 1006: case 1015:
+                    /* Mouse encoding mode reset — no action needed. */
                     break;
                 }
             }

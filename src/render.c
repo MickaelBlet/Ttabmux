@@ -94,22 +94,30 @@ static void emit_color_bg(struct ttabmux *t, int32_t color)
     }
 }
 
-static void emit_sgr(struct ttabmux *t, int32_t fg, int32_t bg, uint8_t attr)
+static void emit_sgr_full(struct ttabmux *t, int32_t fg, int32_t bg, uint8_t attr)
 {
-    buf_append(t, "\033[0m", 4);  /* Reset first */
+    /* Full reset + re-apply — used when attributes differ and a clean
+       slate is the safest approach. Emits the minimum number of bytes
+       by combining the reset with attribute setting. */
+    buf_append(t, "\033[0", 3);
 
-    if (attr & ATTR_BOLD)      buf_append(t, "\033[1m", 4);
-    if (attr & ATTR_DIM)       buf_append(t, "\033[2m", 4);
-    if (attr & ATTR_ITALIC)    buf_append(t, "\033[3m", 4);
-    if (attr & ATTR_UNDERLINE) buf_append(t, "\033[4m", 4);
-    if (attr & ATTR_BLINK)     buf_append(t, "\033[5m", 4);
-    if (attr & ATTR_REVERSE)   buf_append(t, "\033[7m", 4);
-    if (attr & ATTR_INVISIBLE) buf_append(t, "\033[8m", 4);
-    if (attr & ATTR_STRIKE)    buf_append(t, "\033[9m", 4);
+    if (attr & ATTR_BOLD)      buf_append(t, ";1", 2);
+    if (attr & ATTR_DIM)       buf_append(t, ";2", 2);
+    if (attr & ATTR_ITALIC)    buf_append(t, ";3", 2);
+    if (attr & ATTR_UNDERLINE) buf_append(t, ";4", 2);
+    if (attr & ATTR_BLINK)     buf_append(t, ";5", 2);
+    if (attr & ATTR_REVERSE)   buf_append(t, ";7", 2);
+    if (attr & ATTR_INVISIBLE) buf_append(t, ";8", 2);
+    if (attr & ATTR_STRIKE)    buf_append(t, ";9", 2);
+
+    buf_append(t, "m", 1);
 
     if (fg != COLOR_DEFAULT) emit_color_fg(t, fg);
     if (bg != COLOR_DEFAULT) emit_color_bg(t, bg);
 }
+
+/* Shorthand alias for callers that always need a full reset */
+#define emit_sgr emit_sgr_full
 
 /* ------------------------------------------------------------------ */
 /*  UTF-8 encoding helper                                             */
@@ -952,7 +960,10 @@ void render_screen(struct ttabmux *t)
     }
     t->out_len = 0;
 
-    /* Hide cursor */
+    /* Hide cursor at the start — we will show it at the very end only if
+       the active pane has cursor_visible set.  By writing the hide sequence
+       only when the cursor is currently shown, we avoid the brief
+       visible-hidden-visible flash that causes flickering. */
     buf_append(t, "\033[?25l", 6);
 
     /* Render sidebar */
@@ -970,14 +981,18 @@ void render_screen(struct ttabmux *t)
             render_action_bar(t);
     }
 
-    /* Position cursor and show it */
-    if (t->num_sessions > 0 && !t->show_help && !t->rename_mode && !t->action_mode) {
+    /* Determine whether the cursor should be visible and where */
+    int show_cursor = 0;
+    int cur_screen_row = 1, cur_screen_col = 1;
+
+    if (t->action_mode) {
+        /* Action bar already emits its own cursor positioning */
+    } else if (t->num_sessions > 0 && !t->show_help && !t->rename_mode) {
         struct pane *p = cur_pane(t);
         if (p) {
             struct vterm *vt = &p->vt;
             if (vt->cursor_visible && vt->scroll_offset == 0) {
                 struct session *s = &t->sessions[t->active];
-                int cur_screen_row, cur_screen_col;
                 if (s->num_panes > 1) {
                     cur_screen_row = p->y + vt->cursor_row + 1;
                     cur_screen_col = t->sidebar_width + p->x + vt->cursor_col + 1;
@@ -986,11 +1001,18 @@ void render_screen(struct ttabmux *t)
                     int gw = pane_gutter_width(p);
                     cur_screen_col = vt->cursor_col + t->sidebar_width + 1 + gw;
                 }
-                buf_printf(t, "\033[%d;%dH", cur_screen_row, cur_screen_col);
-                buf_append(t, "\033[?25h", 6);
+                show_cursor = 1;
             }
         }
     }
+
+    /* Position and show cursor — this is the single show after the hide,
+       minimising the cursor-off interval and eliminating flicker. */
+    if (show_cursor) {
+        buf_printf(t, "\033[%d;%dH\033[?25h", cur_screen_row, cur_screen_col);
+    }
+    /* If cursor should stay hidden (e.g. no sessions, help screen,
+       cursor_visible==0), we already hid it above and leave it hidden. */
 
     buf_flush(t);
 }

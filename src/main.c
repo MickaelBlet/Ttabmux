@@ -1425,6 +1425,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
                     adj_row = row - p->y + 1;
                 }
                 if (adj_col < 1) adj_col = 1;
+                if (adj_row < 1) adj_row = 1;
                 debug_mouse_forward(t->active, s->active_pane,
                                      button, adj_col, adj_row, 0);
                 char mouse_seq[64];
@@ -1488,12 +1489,15 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
         return;
     }
 
-    /* Forward mouse motion/drag to child app if it has mouse tracking */
+    /* Forward mouse motion/drag to child app if it has mouse tracking.
+     * Button 32 = drag (motion with button held) — requires mode >= 1002.
+     * Button 35 = hover (motion with no button) — requires mode >= 1003. */
     if ((button == 32 || button == 35) && !t->sel_dragging &&
         !t->sidebar_drag && !t->scrollbar_drag &&
         !t->sidebar_sb_drag && !t->split_drag) {
         struct pane *p = cur_pane(t);
-        if (p && p->alive && p->vt.mouse_mode >= 1002 &&
+        int need_mode = (button == 35) ? 1003 : 1002;
+        if (p && p->alive && p->vt.mouse_mode >= need_mode &&
             p->vt.scroll_offset == 0) {
             struct session *s = &t->sessions[t->active];
             int adj_col, adj_row;
@@ -1506,6 +1510,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
                 adj_row = row - p->y + 1;
             }
             if (adj_col < 1) adj_col = 1;
+            if (adj_row < 1) adj_row = 1;
             debug_mouse_forward(t->active, s->active_pane,
                                  button, adj_col, adj_row, 1);
             char mouse_seq[64];
@@ -1931,6 +1936,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
                         adj_row = row - p->y + 1;
                     }
                     if (adj_col < 1) adj_col = 1;
+                    if (adj_row < 1) adj_row = 1;
                     debug_mouse_forward(t->active, s->active_pane,
                                          button, adj_col, adj_row, 1);
                     char mouse_seq[64];
@@ -2022,6 +2028,10 @@ static void parse_sgr_mouse(struct ttabmux *t, int is_press)
     }
     t->inp_len = 0;
     t->inp_state = 0;
+
+    /* SGR mouse coordinates are 1-based; convert to 0-based for internal use */
+    if (col > 0) col--;
+    if (row > 0) row--;
 
     handle_mouse(t, button, col, row, is_press);
 }
@@ -2327,8 +2337,9 @@ static void event_loop(struct ttabmux *t)
                 /* Update tab name on OSC title change */
                 if (p->vt.title_changed) {
                     if (pi == s->active_pane) {
-                        snprintf(s->name, sizeof(s->name),
-                                 "%s", p->vt.title);
+                        char tmp[sizeof(s->name)];
+                        snprintf(tmp, sizeof(tmp), "%s", p->vt.title);
+                        memcpy(s->name, tmp, sizeof(s->name));
                     }
                     p->vt.title_changed = 0;
                     need_render = 1;
