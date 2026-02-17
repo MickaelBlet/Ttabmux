@@ -350,6 +350,10 @@ static void resize_session_panes(struct ttabmux *t, struct session *s)
             pty_rows = p->h;
         }
 
+        /* Account for horizontal scrollbar in wide mode */
+        if (t->wide_cols > 0 && t->wide_cols > pty_cols)
+            pty_rows -= 1;
+
         if (pty_cols < 2) pty_cols = 2;
         if (pty_rows < 2) pty_rows = 2;
 
@@ -380,7 +384,12 @@ static void resize_all_ptys(struct ttabmux *t)
 
     for (int i = 0; i < t->num_sessions; i++) {
         struct session *s = &t->sessions[i];
-        layout_reflow(s, s->root_node, 0, 0, content_w, content_h);
+        int h = content_h;
+        /* Reserve 1 row for action bar (search/jump-to-line) on active session */
+        if (t->action_mode && i == t->active)
+            h -= 1;
+        if (h < 2) h = 2;
+        layout_reflow(s, s->root_node, 0, 0, content_w, h);
         resize_session_panes(t, s);
     }
 }
@@ -739,11 +748,13 @@ static void action_mode_start(struct ttabmux *t, int mode)
     memset(t->action_buf, 0, sizeof(t->action_buf));
     if (mode == 1)
         t->search_match_line = -1;
+    resize_all_ptys(t);
 }
 
 static void action_mode_end(struct ttabmux *t)
 {
     t->action_mode = 0;
+    resize_all_ptys(t);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1019,6 +1030,32 @@ static int search_in_vterm(struct ttabmux *t, const char *query,
             if (target_offset < 0)
                 target_offset = 0;
             vt->scroll_offset = target_offset;
+
+            /* Auto-scroll horizontally to make the match visible */
+            {
+                struct session *ss = &t->sessions[t->active];
+                int visible_w;
+                if (ss->num_panes == 1) {
+                    int gw = pane_gutter_width(p);
+                    int sb = pane_has_scrollbar(p);
+                    visible_w = p->w - gw - sb;
+                } else {
+                    int sb = pane_has_scrollbar(p);
+                    visible_w = p->w - sb;
+                }
+                if (pane_needs_hscroll(p, visible_w)) {
+                    int match_end = t->search_match_col + t->search_match_len;
+                    int max_off = vt->cols - visible_w;
+                    if (max_off < 0) max_off = 0;
+                    if (t->search_match_col < vt->col_offset ||
+                        match_end > vt->col_offset + visible_w) {
+                        int new_off = t->search_match_col - visible_w / 4;
+                        if (new_off < 0) new_off = 0;
+                        if (new_off > max_off) new_off = max_off;
+                        vt->col_offset = new_off;
+                    }
+                }
+            }
             return 1;
         }
     }
@@ -1504,6 +1541,10 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
 
     /* Hover tracking: button 35 = motion with no button (SGR encoding) */
     if (button == 35) {
+        /* Cancel rename mode on any mouse movement */
+        if (t->rename_mode)
+            t->rename_mode = 0;
+
         int on_border = (col >= t->sidebar_width - 1 && col <= t->sidebar_width);
         if (on_border != t->sidebar_hover) {
             t->sidebar_hover = on_border;
@@ -1774,7 +1815,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
             struct session *ss = &t->sessions[t->active];
 
             /* Check if mouse is on the horizontal scrollbar row */
-            if (t->wide_cols > 0) {
+            {
                 int visible_w, hbar_screen_row;
                 if (ss->num_panes == 1) {
                     int gw = pane_gutter_width(p);
@@ -1853,7 +1894,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
     /* Horizontal scroll: button 66 = left, 67 = right
      * Also Shift+scroll: button 68 = shift+up (left), 69 = shift+down (right) */
     if (button == 66 || button == 67 || button == 68 || button == 69) {
-        if (t->wide_cols > 0 && col >= t->sidebar_width) {
+        if (col >= t->sidebar_width) {
             int target_idx = find_pane_at(t, col, row);
             struct pane *p;
             if (target_idx >= 0) {
@@ -1926,7 +1967,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
     }
 
     /* Click on horizontal scrollbar row */
-    if (t->wide_cols > 0 && t->num_sessions > 0 && col >= t->sidebar_width) {
+    if (t->num_sessions > 0 && col >= t->sidebar_width) {
         struct session *s = &t->sessions[t->active];
         for (int pi2 = 0; pi2 < s->num_panes; pi2++) {
             struct pane *pp = &s->panes[pi2];
