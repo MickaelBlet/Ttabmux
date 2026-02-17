@@ -103,6 +103,8 @@ struct vterm {
     /* Response buffer for DA/DSR queries (written back to PTY by caller) */
     char resp_buf[128];
     int resp_len;
+    /* Horizontal scroll offset (wide mode) */
+    int col_offset;
 };
 
 /* A terminal pane (one PTY within a tab) */
@@ -132,7 +134,8 @@ struct session {
     int active_pane;
     struct layout_node layout[MAX_LAYOUT_NODES];
     int root_node;
-    char name[64];
+    char name[256];
+    int renamed;            /* 1 = user renamed; suppress OSC title updates */
     int bell;
 };
 
@@ -147,11 +150,14 @@ struct ttabmux {
     int running;
     int prefix_mode;
     const char *default_shell;  /* shell for new tabs (Ctrl+B c) */
+    int wide_cols;              /* 0 = normal, >0 = PTY column count for wide mode */
     int show_help;
     /* Rename mode */
     int rename_mode;
-    char rename_buf[64];
+    char rename_buf[256];
     int rename_len;
+    int rename_cursor_row;   /* screen row of rename cursor (set by render) */
+    int rename_cursor_col;   /* screen col of rename cursor (set by render) */
     /* Action bar (search / jump-to-line) */
     int action_mode;         /* 0=off, 1=search, 2=jump-to-line */
     char action_buf[256];
@@ -159,6 +165,8 @@ struct ttabmux {
     int search_match_line;   /* absolute line of current match (-1=none) */
     int search_match_col;    /* column of current match start */
     int search_match_len;    /* length of match in cells */
+    int search_match_index;  /* 1-based index of current match */
+    int search_match_total;  /* total number of matches */
     /* Sidebar drag resize */
     int sidebar_drag;
     int sidebar_hover;      /* mouse is on the resize border */
@@ -167,6 +175,9 @@ struct ttabmux {
     int sidebar_sb_drag;    /* dragging the sidebar scrollbar */
     /* Scrollbar drag */
     int scrollbar_drag;
+    /* Horizontal scrollbar drag */
+    int hscrollbar_drag;
+    int hscrollbar_drag_pane;   /* pane index being dragged */
     /* Split pane divider drag/resize */
     int split_drag;
     int split_drag_node;
@@ -218,6 +229,10 @@ static inline int pane_gutter_width(struct pane *p) {
 
 static inline int pane_has_scrollbar(struct pane *p) {
     return (p->vt.sb_len > 0 && !p->vt.alt_active) ? 1 : 0;
+}
+
+static inline int pane_needs_hscroll(struct pane *p, int visible_w) {
+    return (p->vt.cols > visible_w) ? 1 : 0;
 }
 
 static inline int session_is_alive(struct session *s) {

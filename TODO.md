@@ -1,7 +1,6 @@
 # TODO
 
-[ ] Not remove on session list when last pane is dead
-[ ] Add scrollbar on vertical and horizontal split panes
-[ ] Add buttons for split easely at bottom of sidebar
-[ ] Add buttons for search easely at bottom of sidebar
-[ ] Add buttons for close easely at bottom of sidebar
+* [ ] adjust the height of pane when horizontal scrollbar is displayed
+* [ ] rename action disable after mouse move
+* [ ] horizontal scroll wheel not work
+* [ ] search can be horizontal scrolling automaticely

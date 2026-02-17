@@ -96,16 +96,18 @@ static void emit_color_bg(struct ttabmux *t, int32_t color)
 
 static void emit_sgr(struct ttabmux *t, int32_t fg, int32_t bg, uint8_t attr)
 {
-    buf_append(t, "\033[0m", 4);  /* Reset first */
+    buf_append(t, "\033[0", 3);
 
-    if (attr & ATTR_BOLD)      buf_append(t, "\033[1m", 4);
-    if (attr & ATTR_DIM)       buf_append(t, "\033[2m", 4);
-    if (attr & ATTR_ITALIC)    buf_append(t, "\033[3m", 4);
-    if (attr & ATTR_UNDERLINE) buf_append(t, "\033[4m", 4);
-    if (attr & ATTR_BLINK)     buf_append(t, "\033[5m", 4);
-    if (attr & ATTR_REVERSE)   buf_append(t, "\033[7m", 4);
-    if (attr & ATTR_INVISIBLE) buf_append(t, "\033[8m", 4);
-    if (attr & ATTR_STRIKE)    buf_append(t, "\033[9m", 4);
+    if (attr & ATTR_BOLD)      buf_append(t, ";1", 2);
+    if (attr & ATTR_DIM)       buf_append(t, ";2", 2);
+    if (attr & ATTR_ITALIC)    buf_append(t, ";3", 2);
+    if (attr & ATTR_UNDERLINE) buf_append(t, ";4", 2);
+    if (attr & ATTR_BLINK)     buf_append(t, ";5", 2);
+    if (attr & ATTR_REVERSE)   buf_append(t, ";7", 2);
+    if (attr & ATTR_INVISIBLE) buf_append(t, ";8", 2);
+    if (attr & ATTR_STRIKE)    buf_append(t, ";9", 2);
+
+    buf_append(t, "m", 1);
 
     if (fg != COLOR_DEFAULT) emit_color_fg(t, fg);
     if (bg != COLOR_DEFAULT) emit_color_bg(t, bg);
@@ -227,30 +229,51 @@ static void render_sidebar(struct ttabmux *t)
                 int is_active = (idx == t->active);
                 int is_alive  = session_is_alive(&t->sessions[idx]);
 
-                if (is_active) {
-                    buf_append(t, "\033[0;1;90;47m", 13);
+                /* Inline rename input for the active session */
+                if (t->rename_mode && is_active) {
+                    buf_append(t, "\033[0;1;33;44m", 12); /* bold yellow on blue */
+                    char line[256];
+                    int show = t->rename_len;
+                    int llen = 0;
+                    llen = snprintf(line, sizeof(line), " R %d: ", idx + 1);
+                    int start_cursor = llen;
+                    if (show > 0) {
+                        memcpy(line + llen, t->rename_buf, (size_t)show);
+                        llen += show;
+                    }
+                    buf_append(t, line, llen);
+                    for (int c = llen; c < content_w; c++)
+                        buf_append(t, " ", 1);
+                    buf_append(t, "\033[0m", 4);
+                    /* Record cursor position for later */
+                    t->rename_cursor_row = row + 1;
+                    t->rename_cursor_col = start_cursor + 1 + show;
                 } else {
-                    buf_append(t, "\033[0;37;40m", 11);
-                }
+                    if (is_active) {
+                        buf_append(t, "\033[0;1;90;47m", 13);
+                    } else {
+                        buf_append(t, "\033[0;37;40m", 11);
+                    }
 
-                char line[64];
-                int llen;
-                if (is_alive) {
-                    llen = snprintf(line, sizeof(line), " %s%d: %s",
-                                    is_active ? "> " : "  ",
-                                    idx + 1,
-                                    t->sessions[idx].name);
-                } else {
-                    llen = snprintf(line, sizeof(line), " %s%d: [dead]",
-                                    is_active ? "> " : "  ",
-                                    idx + 1);
-                }
+                    char line[256];
+                    int llen;
+                    if (is_alive) {
+                        llen = snprintf(line, sizeof(line), " %s%d: %s",
+                                        is_active ? "> " : "  ",
+                                        idx + 1,
+                                        t->sessions[idx].name);
+                    } else {
+                        llen = snprintf(line, sizeof(line), " %s%d: [dead]",
+                                        is_active ? "> " : "  ",
+                                        idx + 1);
+                    }
 
-                if (llen > content_w) llen = content_w;
-                buf_append(t, line, llen);
-                for (int c = llen; c < content_w; c++)
-                    buf_append(t, " ", 1);
-                buf_append(t, "\033[0m", 4);
+                    if (llen > content_w) llen = content_w;
+                    buf_append(t, line, llen);
+                    for (int c = llen; c < content_w; c++)
+                        buf_append(t, " ", 1);
+                    buf_append(t, "\033[0m", 4);
+                }
             } else {
                 /* Empty slot */
                 buf_append(t, "\033[0m", 4);
@@ -449,26 +472,7 @@ static void render_help(struct ttabmux *t)
 /*  Rename mode overlay                                               */
 /* ------------------------------------------------------------------ */
 
-static void render_rename(struct ttabmux *t)
-{
-    int sw = t->sidebar_width;
-    int area_cols = t->term_cols - sw;
-    int mid_row = t->term_rows / 2;
-
-    buf_printf(t, "\033[%d;%dH", mid_row, sw + 1);
-    buf_append(t, "\033[0;1;33m", 9);  /* Bold yellow */
-
-    const char *prompt = " Rename: ";
-    int plen = (int)strlen(prompt);
-    buf_append(t, prompt, plen);
-    buf_append(t, t->rename_buf, t->rename_len);
-
-    int total = plen + t->rename_len;
-    for (int c = total; c < area_cols; c++)
-        buf_append(t, " ", 1);
-
-    buf_append(t, "\033[0m", 4);
-}
+/* render_rename removed — rename input is now inline in the sidebar */
 
 /* ------------------------------------------------------------------ */
 /*  Action bar rendering (search / jump-to-line)                      */
@@ -477,10 +481,22 @@ static void render_rename(struct ttabmux *t)
 static void render_action_bar(struct ttabmux *t)
 {
     int sw = t->sidebar_width;
-    int area_cols = t->term_cols - sw;
+    struct pane *p = cur_pane(t);
+    struct session *s = &t->sessions[t->active];
 
-    /* Draw on the last row of the terminal area */
-    buf_printf(t, "\033[%d;%dH", t->term_rows, sw + 1);
+    /* Position at the bottom of the current pane */
+    int bar_row, bar_col, bar_w;
+    if (p && s->num_panes > 1) {
+        bar_row = p->y + p->h;       /* last row of the pane */
+        bar_col = sw + p->x + 1;     /* pane left edge */
+        bar_w = p->w;
+    } else {
+        bar_row = t->term_rows;
+        bar_col = sw + 1;
+        bar_w = t->term_cols - sw;
+    }
+
+    buf_printf(t, "\033[%d;%dH", bar_row, bar_col);
     buf_append(t, "\033[0;1;33;44m", 12);  /* Bold yellow on blue */
 
     int total = 0;
@@ -491,17 +507,21 @@ static void render_action_bar(struct ttabmux *t)
         buf_append(t, t->action_buf, t->action_len);
         total = 3 + t->action_len;
 
-        /* Show hints */
-        const char *hint;
-        if (t->search_match_line < 0)
-            hint = "  [not found]  n:next N:prev ESC:close";
-        else
-            hint = "  n:next N:prev ESC:close";
-        int hlen = (int)strlen(hint);
-        if (total + hlen < area_cols) {
+        /* Show match count and hints */
+        char info[128];
+        if (t->search_match_line < 0) {
+            snprintf(info, sizeof(info),
+                     "  [no results]  n:next N:prev ESC:close");
+        } else {
+            snprintf(info, sizeof(info),
+                     "  [%d/%d]  n:next N:prev ESC:close",
+                     t->search_match_index, t->search_match_total);
+        }
+        int ilen = (int)strlen(info);
+        if (total + ilen < bar_w) {
             buf_append(t, "\033[0;37;44m", 10);  /* Normal white on blue */
-            buf_append(t, hint, hlen);
-            total += hlen;
+            buf_append(t, info, ilen);
+            total += ilen;
         }
     } else {
         /* Search input or jump-to-line mode */
@@ -511,20 +531,25 @@ static void render_action_bar(struct ttabmux *t)
         buf_append(t, t->action_buf, t->action_len);
         total = plen + t->action_len;
 
-        /* Show "not found" hint in search input mode */
-        if (t->action_mode == 1 && t->action_len > 0 &&
-            t->search_match_line < 0) {
-            const char *nf = " [not found]";
-            int nflen = (int)strlen(nf);
-            if (total + nflen < area_cols) {
-                buf_append(t, nf, nflen);
-                total += nflen;
+        /* Show match count or "no results" in search input mode */
+        if (t->action_mode == 1 && t->action_len > 0) {
+            char info[64];
+            if (t->search_match_line < 0)
+                snprintf(info, sizeof(info), " [no results]");
+            else
+                snprintf(info, sizeof(info), " [%d/%d]",
+                         t->search_match_index, t->search_match_total);
+            int ilen = (int)strlen(info);
+            if (total + ilen < bar_w) {
+                buf_append(t, "\033[0;37;44m", 10);
+                buf_append(t, info, ilen);
+                total += ilen;
             }
         }
     }
 
     buf_append(t, "\033[0;1;33;44m", 12);  /* Restore for padding */
-    for (int c = total; c < area_cols; c++)
+    for (int c = total; c < bar_w; c++)
         buf_append(t, " ", 1);
 
     buf_append(t, "\033[0m", 4);
@@ -532,8 +557,8 @@ static void render_action_bar(struct ttabmux *t)
     /* Position cursor — show in input modes, hide in nav mode */
     if (t->action_mode != 3) {
         int plen = (t->action_mode == 1) ? 3 : 3;
-        buf_printf(t, "\033[%d;%dH", t->term_rows,
-                   sw + 1 + plen + t->action_len);
+        buf_printf(t, "\033[%d;%dH", bar_row,
+                   bar_col + plen + t->action_len);
         buf_append(t, "\033[?25h", 6);
     }
 }
@@ -554,6 +579,22 @@ static void render_pane_content(struct ttabmux *t, struct pane *p)
     int show_sb = pane_has_scrollbar(p);
     int content_w = show_sb ? (p->w - 1) : p->w;
     if (content_w < 1) content_w = 1;
+
+    /* Horizontal scrollbar */
+    int show_hscroll = pane_needs_hscroll(p, content_w);
+    int visible_rows = p->h;
+    if (show_hscroll) visible_rows -= 1;  /* reserve bottom row */
+    if (visible_rows < 1) visible_rows = 1;
+    int col_off = vt->col_offset;
+    /* Clamp col_offset */
+    if (show_hscroll) {
+        int max_off = vt->cols - content_w;
+        if (max_off < 0) max_off = 0;
+        if (col_off > max_off) col_off = max_off;
+        if (col_off < 0) col_off = 0;
+    } else {
+        col_off = 0;
+    }
 
     /* Scrollbar thumb position */
     int sb_thumb_start = 0, sb_thumb_end = 0;
@@ -579,7 +620,7 @@ static void render_pane_content(struct ttabmux *t, struct pane *p)
     uint8_t prev_attr = 0;
     int need_sgr_reset = 1;
 
-    for (int row = 0; row < p->h && p->y + row < t->term_rows; row++) {
+    for (int row = 0; row < visible_rows && p->y + row < t->term_rows; row++) {
         buf_printf(t, "\033[%d;%dH", p->y + row + 1, sw + p->x + 1);
 
         struct cell *line = NULL;
@@ -617,7 +658,8 @@ static void render_pane_content(struct ttabmux *t, struct pane *p)
                     sel_on_row = 1;
             }
 
-            for (int col = 0; col < vt->cols && col < content_w; col++) {
+            int drawn = 0;
+            for (int col = col_off; col < vt->cols && drawn < content_w; col++) {
                 struct cell *c = &line[col];
                 if (c->width == 0) continue;
 
@@ -665,6 +707,14 @@ static void render_pane_content(struct ttabmux *t, struct pane *p)
                     int n = encode_utf8(c->ch, utf8);
                     buf_append(t, utf8, n);
                 }
+                drawn++;
+            }
+            /* Fill remaining space if line ended before content_w */
+            if (drawn < content_w) {
+                buf_append(t, "\033[0m", 4);
+                for (int i = drawn; i < content_w; i++)
+                    buf_append(t, " ", 1);
+                need_sgr_reset = 1;
             }
         }
 
@@ -676,6 +726,37 @@ static void render_pane_content(struct ttabmux *t, struct pane *p)
             } else {
                 buf_append(t, "\033[0;90m\xe2\x96\x91\033[0m", 14);
             }
+        }
+    }
+
+    /* Draw horizontal scrollbar at bottom row of pane */
+    if (show_hscroll && p->y + visible_rows < t->term_rows) {
+        int hbar_row = p->y + visible_rows;
+        buf_printf(t, "\033[%d;%dH", hbar_row + 1, sw + p->x + 1);
+
+        int track_w = content_w;
+        int thumb_w = (content_w * track_w) / vt->cols;
+        if (thumb_w < 1) thumb_w = 1;
+        int max_off = vt->cols - content_w;
+        if (max_off < 1) max_off = 1;
+        int thumb_pos = (col_off * (track_w - thumb_w)) / max_off;
+        if (thumb_pos < 0) thumb_pos = 0;
+        if (thumb_pos + thumb_w > track_w) thumb_pos = track_w - thumb_w;
+
+        for (int i = 0; i < track_w; i++) {
+            if (i >= thumb_pos && i < thumb_pos + thumb_w) {
+                /* Thumb: ━ (U+2501) in white */
+                buf_append(t, "\033[0;37m\xe2\x94\x81\033[0m", 14);
+            } else {
+                /* Track: ─ (U+2500) in dim gray */
+                buf_append(t, "\033[0;90m\xe2\x94\x80\033[0m", 14);
+            }
+        }
+        /* Scrollbar on h-scrollbar row */
+        if (show_sb) {
+            buf_printf(t, "\033[%d;%dH", hbar_row + 1, sw + p->x + p->w);
+            buf_append(t, "\033[0;90m ", 8);
+            buf_append(t, "\033[0m", 4);
         }
     }
 
@@ -819,12 +900,27 @@ static void render_terminal(struct ttabmux *t)
         thumb_end = thumb_top + thumb_h;
     }
 
+    /* Horizontal scrollbar */
+    int show_hscroll = pane_needs_hscroll(p, content_cols);
+    int visible_rows = vt->rows;
+    if (show_hscroll) visible_rows -= 1;  /* reserve bottom row */
+    if (visible_rows < 1) visible_rows = 1;
+    int col_off = vt->col_offset;
+    if (show_hscroll) {
+        int max_off = vt->cols - content_cols;
+        if (max_off < 0) max_off = 0;
+        if (col_off > max_off) col_off = max_off;
+        if (col_off < 0) col_off = 0;
+    } else {
+        col_off = 0;
+    }
+
     int32_t prev_fg = COLOR_DEFAULT;
     int32_t prev_bg = COLOR_DEFAULT;
     uint8_t prev_attr = 0;
     int need_sgr_reset = 1;
 
-    for (int row = 0; row < vt->rows && row < t->term_rows; row++) {
+    for (int row = 0; row < visible_rows && row < t->term_rows; row++) {
         if (show_linenr) {
             buf_printf(t, "\033[%d;%dH", row + 1, sw + 1);
             int line_nr = vt->sb_len - so + row + 1;
@@ -874,7 +970,8 @@ static void render_terminal(struct ttabmux *t)
                 sel_on_row = 1;
         }
 
-        for (int col = 0; col < vt->cols && col < content_cols; col++) {
+        int drawn = 0;
+        for (int col = col_off; col < vt->cols && drawn < content_cols; col++) {
             struct cell *c = &line[col];
             if (c->width == 0) continue;
 
@@ -922,17 +1019,65 @@ static void render_terminal(struct ttabmux *t)
                 int n = encode_utf8(c->ch, utf8);
                 buf_append(t, utf8, n);
             }
+            drawn++;
+        }
+        /* Fill remaining space if line ended before content_cols */
+        if (drawn < content_cols) {
+            buf_append(t, "\033[0m", 4);
+            for (int i = drawn; i < content_cols; i++)
+                buf_append(t, " ", 1);
+            need_sgr_reset = 1;
         }
     }
 
     if (show_scrollbar) {
-        for (int row = 0; row < vt->rows && row < t->term_rows; row++) {
+        for (int row = 0; row < visible_rows && row < t->term_rows; row++) {
             buf_printf(t, "\033[%d;%dH", row + 1, sb_col);
             if (row >= thumb_start && row < thumb_end) {
                 buf_append(t, "\033[0;37m\xe2\x96\x88\033[0m", 14);
             } else {
                 buf_append(t, "\033[0;90m\xe2\x96\x91\033[0m", 14);
             }
+        }
+    }
+
+    /* Horizontal scrollbar at bottom row */
+    if (show_hscroll && visible_rows < t->term_rows) {
+        int hbar_row = visible_rows;
+        buf_printf(t, "\033[%d;%dH", hbar_row + 1, content_start);
+
+        int track_w = content_cols;
+        int thumb_w = (content_cols * track_w) / vt->cols;
+        if (thumb_w < 1) thumb_w = 1;
+        int max_off = vt->cols - content_cols;
+        if (max_off < 1) max_off = 1;
+        int thumb_pos = (col_off * (track_w - thumb_w)) / max_off;
+        if (thumb_pos < 0) thumb_pos = 0;
+        if (thumb_pos + thumb_w > track_w) thumb_pos = track_w - thumb_w;
+
+        /* Gutter area for h-scrollbar row */
+        if (show_linenr) {
+            buf_printf(t, "\033[%d;%dH", hbar_row + 1, sw + 1);
+            buf_append(t, "\033[0m", 4);
+            for (int i = 0; i < gutter_w; i++)
+                buf_append(t, " ", 1);
+        }
+
+        buf_printf(t, "\033[%d;%dH", hbar_row + 1, content_start);
+        for (int i = 0; i < track_w; i++) {
+            if (i >= thumb_pos && i < thumb_pos + thumb_w) {
+                /* Thumb: ━ (U+2501) in white */
+                buf_append(t, "\033[0;37m\xe2\x94\x81\033[0m", 14);
+            } else {
+                /* Track: ─ (U+2500) in dim gray */
+                buf_append(t, "\033[0;90m\xe2\x94\x80\033[0m", 14);
+            }
+        }
+
+        /* Scrollbar column on h-scrollbar row */
+        if (show_scrollbar) {
+            buf_printf(t, "\033[%d;%dH", hbar_row + 1, sb_col);
+            buf_append(t, "\033[0m ", 5);
         }
     }
 
@@ -961,9 +1106,6 @@ void render_screen(struct ttabmux *t)
     /* Render main area */
     if (t->show_help) {
         render_help(t);
-    } else if (t->rename_mode) {
-        render_terminal(t);
-        render_rename(t);
     } else {
         render_terminal(t);
         if (t->action_mode)
@@ -971,23 +1113,39 @@ void render_screen(struct ttabmux *t)
     }
 
     /* Position cursor and show it */
-    if (t->num_sessions > 0 && !t->show_help && !t->rename_mode && !t->action_mode) {
+    if (t->rename_mode) {
+        /* Cursor in the sidebar rename input */
+        buf_printf(t, "\033[%d;%dH", t->rename_cursor_row, t->rename_cursor_col);
+        buf_append(t, "\033[?25h", 6);
+    } else if (t->num_sessions > 0 && !t->show_help && !t->action_mode) {
         struct pane *p = cur_pane(t);
         if (p) {
             struct vterm *vt = &p->vt;
             if (vt->cursor_visible && vt->scroll_offset == 0) {
                 struct session *s = &t->sessions[t->active];
+                int coff = vt->col_offset;
                 int cur_screen_row, cur_screen_col;
+                int visible_col = vt->cursor_col - coff;
                 if (s->num_panes > 1) {
-                    cur_screen_row = p->y + vt->cursor_row + 1;
-                    cur_screen_col = t->sidebar_width + p->x + vt->cursor_col + 1;
+                    int sb = pane_has_scrollbar(p);
+                    int vis_w = p->w - sb;
+                    if (visible_col >= 0 && visible_col < vis_w) {
+                        cur_screen_row = p->y + vt->cursor_row + 1;
+                        cur_screen_col = t->sidebar_width + p->x + visible_col + 1;
+                        buf_printf(t, "\033[%d;%dH", cur_screen_row, cur_screen_col);
+                        buf_append(t, "\033[?25h", 6);
+                    }
                 } else {
-                    cur_screen_row = vt->cursor_row + 1;
                     int gw = pane_gutter_width(p);
-                    cur_screen_col = vt->cursor_col + t->sidebar_width + 1 + gw;
+                    int sb = pane_has_scrollbar(p);
+                    int vis_w = (t->term_cols - t->sidebar_width) - gw - sb;
+                    if (visible_col >= 0 && visible_col < vis_w) {
+                        cur_screen_row = vt->cursor_row + 1;
+                        cur_screen_col = visible_col + t->sidebar_width + 1 + gw;
+                        buf_printf(t, "\033[%d;%dH", cur_screen_row, cur_screen_col);
+                        buf_append(t, "\033[?25h", 6);
+                    }
                 }
-                buf_printf(t, "\033[%d;%dH", cur_screen_row, cur_screen_col);
-                buf_append(t, "\033[?25h", 6);
             }
         }
     }
