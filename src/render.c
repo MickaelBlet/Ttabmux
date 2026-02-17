@@ -669,7 +669,9 @@ static void render_pane_content(struct ttabmux *t, struct pane *p)
 
                 int in_sel = 0;
                 if (sel_on_row) {
-                    if (sel_sl == sel_el) {
+                    if (sel_sl == sel_el && sel_sc == sel_ec) {
+                        in_sel = 0;
+                    } else if (sel_sl == sel_el) {
                         in_sel = (col >= sel_sc && col <= sel_ec);
                     } else if (abs_line == sel_sl) {
                         in_sel = (col >= sel_sc);
@@ -981,7 +983,9 @@ static void render_terminal(struct ttabmux *t)
 
             int in_sel = 0;
             if (sel_on_row) {
-                if (sel_sl == sel_el) {
+                if (sel_sl == sel_el && sel_sc == sel_ec) {
+                    in_sel = 0;
+                } else if (sel_sl == sel_el) {
                     in_sel = (col >= sel_sc && col <= sel_ec);
                 } else if (abs_line == sel_sl) {
                     in_sel = (col >= sel_sc);

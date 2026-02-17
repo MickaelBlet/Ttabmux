@@ -2137,7 +2137,6 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
                 if (pane_idx >= 0 && pane_idx != s->active_pane) {
                     s->active_pane = pane_idx;
                     clear_selection(t);
-                    return; /* consume the click — don't forward to new pane */
                 }
             }
 
