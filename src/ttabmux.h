@@ -137,6 +137,7 @@ struct session {
     char name[256];
     int renamed;            /* 1 = user renamed; suppress OSC title updates */
     int bell;
+    int wide_cols;          /* 0 = normal, >0 = PTY column count for wide mode */
 };
 
 /* Main application state */
@@ -150,7 +151,6 @@ struct ttabmux {
     int running;
     int prefix_mode;
     const char *default_shell;  /* shell for new tabs (Ctrl+B c) */
-    int wide_cols;              /* 0 = normal, >0 = PTY column count for wide mode */
     int show_help;
     /* Rename mode */
     int rename_mode;
@@ -158,6 +158,10 @@ struct ttabmux {
     int rename_len;
     int rename_cursor_row;   /* screen row of rename cursor (set by render) */
     int rename_cursor_col;   /* screen col of rename cursor (set by render) */
+    /* Wide mode input */
+    int wide_mode;           /* 1 = inputting wide cols value */
+    char wide_buf[16];
+    int wide_len;
     /* Action bar (search / jump-to-line) */
     int action_mode;         /* 0=off, 1=search, 2=jump-to-line */
     char action_buf[256];
@@ -219,12 +223,8 @@ static inline struct pane *cur_pane(struct ttabmux *t) {
 }
 
 static inline int pane_gutter_width(struct pane *p) {
-    if (p->vt.sb_len == 0 || p->vt.alt_active) return 0;
-    int max_line = p->vt.sb_len + p->vt.rows;
-    int w = 1;
-    for (int n = max_line; n >= 10; n /= 10)
-        w++;
-    return w + 1;
+    (void)p;
+    return 0;
 }
 
 static inline int pane_has_scrollbar(struct pane *p) {

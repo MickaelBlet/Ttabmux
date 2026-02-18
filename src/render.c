@@ -248,6 +248,24 @@ static void render_sidebar(struct ttabmux *t)
                     /* Record cursor position for later */
                     t->rename_cursor_row = row + 1;
                     t->rename_cursor_col = start_cursor + 1 + show;
+                } else if (t->wide_mode && is_active) {
+                    buf_append(t, "\033[0;1;33;44m", 12); /* bold yellow on blue */
+                    char line[256];
+                    int show = t->wide_len;
+                    int llen = 0;
+                    llen = snprintf(line, sizeof(line), " W %d: ", idx + 1);
+                    int start_cursor = llen;
+                    if (show > 0) {
+                        memcpy(line + llen, t->wide_buf, (size_t)show);
+                        llen += show;
+                    }
+                    buf_append(t, line, llen);
+                    for (int c = llen; c < content_w; c++)
+                        buf_append(t, " ", 1);
+                    buf_append(t, "\033[0m", 4);
+                    /* Record cursor position for later */
+                    t->rename_cursor_row = row + 1;
+                    t->rename_cursor_col = start_cursor + 1 + show;
                 } else {
                     if (is_active) {
                         buf_append(t, "\033[0;1;90;47m", 13);
@@ -361,34 +379,60 @@ static void render_sidebar(struct ttabmux *t)
 
             buf_append(t, bdr_vert, bdr_vert_len);
         } else if (row == t->term_rows - 1) {
-            /* Bottom button bar: [Help] [Quit] */
-            int btn_w = (sw - 1) / 2;  /* half width each */
-            int btn_w2 = (sw - 1) - btn_w;
+            /* Bottom button bar: [Help] [Wide] [Quit] */
+            int btn_w = (sw - 1) / 3;
+            int used = 0;
 
             /* Help button */
             if (t->sidebar_btn_hover == 1)
                 buf_append(t, "\033[0;1;36;40m", 12);  /* bold cyan on black */
             else
                 buf_append(t, "\033[0;90m", 7);         /* dim gray */
-            const char *help_lbl = " ? Help";
-            int hlen = (int)strlen(help_lbl);
-            if (hlen > btn_w) hlen = btn_w;
-            buf_append(t, help_lbl, hlen);
-            for (int c = hlen; c < btn_w; c++)
-                buf_append(t, " ", 1);
+            {
+                const char *lbl = " ? Help";
+                int llen = (int)strlen(lbl);
+                if (llen > btn_w) llen = btn_w;
+                buf_append(t, lbl, llen);
+                for (int c = llen; c < btn_w; c++)
+                    buf_append(t, " ", 1);
+            }
+            used += btn_w;
             buf_append(t, "\033[0m", 4);
 
-            /* Quit button */
+            /* Wide button */
+            {
+                int wide_active = (t->num_sessions > 0 &&
+                                   t->sessions[t->active].wide_cols > 0);
+                if (t->sidebar_btn_hover == 7)
+                    buf_append(t, "\033[0;1;35;40m", 12);  /* bold magenta */
+                else if (wide_active)
+                    buf_append(t, "\033[0;1;36;40m", 12);  /* bold cyan */
+                else
+                    buf_append(t, "\033[0;90m", 7);         /* dim gray */
+                const char *lbl = " W Wide";
+                int llen = (int)strlen(lbl);
+                if (llen > btn_w) llen = btn_w;
+                buf_append(t, lbl, llen);
+                for (int c = llen; c < btn_w; c++)
+                    buf_append(t, " ", 1);
+            }
+            used += btn_w;
+            buf_append(t, "\033[0m", 4);
+
+            /* Quit button (gets remainder) */
+            int btn_w3 = (sw - 1) - used;
             if (t->sidebar_btn_hover == 2)
                 buf_append(t, "\033[0;1;31;40m", 12);  /* bold red on black */
             else
                 buf_append(t, "\033[0;90m", 7);         /* dim gray */
-            const char *quit_lbl = " x Quit";
-            int qlen = (int)strlen(quit_lbl);
-            if (qlen > btn_w2) qlen = btn_w2;
-            buf_append(t, quit_lbl, qlen);
-            for (int c = qlen; c < btn_w2; c++)
-                buf_append(t, " ", 1);
+            {
+                const char *lbl = " x Quit";
+                int llen = (int)strlen(lbl);
+                if (llen > btn_w3) llen = btn_w3;
+                buf_append(t, lbl, llen);
+                for (int c = llen; c < btn_w3; c++)
+                    buf_append(t, " ", 1);
+            }
             buf_append(t, "\033[0m", 4);
 
             buf_append(t, bdr_vert, bdr_vert_len);
@@ -429,8 +473,8 @@ static void render_help(struct ttabmux *t)
         "  o       Cycle pane focus",
         "  Arrows  Navigate panes",
         "  ,       Rename current terminal",
+        "  w       Toggle wide mode",
         "  /       Search (n/N to navigate)",
-        "  g       Jump to line number",
         "  d       Detach (quit)",
         "  ?       Toggle this help",
         "",
@@ -475,7 +519,7 @@ static void render_help(struct ttabmux *t)
 /* render_rename removed — rename input is now inline in the sidebar */
 
 /* ------------------------------------------------------------------ */
-/*  Action bar rendering (search / jump-to-line)                      */
+/*  Action bar rendering (search)                                     */
 /* ------------------------------------------------------------------ */
 
 static void render_action_bar(struct ttabmux *t)
@@ -524,15 +568,13 @@ static void render_action_bar(struct ttabmux *t)
             total += ilen;
         }
     } else {
-        /* Search input or jump-to-line mode */
-        const char *prefix = (t->action_mode == 1) ? " / " : " : ";
-        int plen = (int)strlen(prefix);
-        buf_append(t, prefix, plen);
+        /* Search input mode */
+        buf_append(t, " / ", 3);
         buf_append(t, t->action_buf, t->action_len);
-        total = plen + t->action_len;
+        total = 3 + t->action_len;
 
-        /* Show match count or "no results" in search input mode */
-        if (t->action_mode == 1 && t->action_len > 0) {
+        /* Show match count or "no results" */
+        if (t->action_len > 0) {
             char info[64];
             if (t->search_match_line < 0)
                 snprintf(info, sizeof(info), " [no results]");
@@ -554,11 +596,10 @@ static void render_action_bar(struct ttabmux *t)
 
     buf_append(t, "\033[0m", 4);
 
-    /* Position cursor — show in input modes, hide in nav mode */
-    if (t->action_mode != 3) {
-        int plen = (t->action_mode == 1) ? 3 : 3;
+    /* Position cursor in search input mode */
+    if (t->action_mode == 1) {
         buf_printf(t, "\033[%d;%dH", bar_row,
-                   bar_col + plen + t->action_len);
+                   bar_col + 3 + t->action_len);
         buf_append(t, "\033[?25h", 6);
     }
 }
@@ -583,7 +624,9 @@ static void render_pane_content(struct ttabmux *t, struct pane *p)
     /* Horizontal scrollbar */
     int show_hscroll = pane_needs_hscroll(p, content_w);
     int visible_rows = p->h;
-    if (show_hscroll) visible_rows -= 1;  /* reserve bottom row */
+    if (show_hscroll) visible_rows -= 1;  /* reserve bottom row for hscroll */
+    if (t->action_mode && p == cur_pane(t))
+        visible_rows -= 1;  /* reserve bottom row for search bar */
     if (visible_rows < 1) visible_rows = 1;
     int col_off = vt->col_offset;
     /* Clamp col_offset */
@@ -865,22 +908,11 @@ static void render_terminal(struct ttabmux *t)
     int so = vt->scroll_offset;
     if (so > vt->sb_len) so = vt->sb_len;
 
-    /* Line number gutter */
-    int show_linenr = (vt->sb_len > 0 && !vt->alt_active);
-    int gutter_w = 0;
-    if (show_linenr) {
-        int max_line = vt->sb_len + vt->rows;
-        gutter_w = 1;
-        for (int n = max_line; n >= 10; n /= 10)
-            gutter_w++;
-        gutter_w += 1;
-    }
-
     /* Scrollbar */
     int show_scrollbar = (vt->sb_len > 0 && !vt->alt_active);
     int sb_col = t->term_cols;
-    int content_start = sw + 1 + gutter_w;
-    int content_cols = area_cols - gutter_w;
+    int content_start = sw + 1;
+    int content_cols = area_cols;
     int thumb_start = 0, thumb_end = 0;
 
     if (show_scrollbar) {
@@ -904,8 +936,7 @@ static void render_terminal(struct ttabmux *t)
 
     /* Horizontal scrollbar */
     int show_hscroll = pane_needs_hscroll(p, content_cols);
-    int visible_rows = vt->rows;
-    if (show_hscroll) visible_rows -= 1;  /* reserve bottom row */
+    int visible_rows = vt->rows;  /* already accounts for hscroll and action bar via PTY resize */
     if (visible_rows < 1) visible_rows = 1;
     int col_off = vt->col_offset;
     if (show_hscroll) {
@@ -923,17 +954,6 @@ static void render_terminal(struct ttabmux *t)
     int need_sgr_reset = 1;
 
     for (int row = 0; row < visible_rows && row < t->term_rows; row++) {
-        if (show_linenr) {
-            buf_printf(t, "\033[%d;%dH", row + 1, sw + 1);
-            int line_nr = vt->sb_len - so + row + 1;
-            if (line_nr >= 1 && line_nr <= vt->sb_len + vt->rows) {
-                buf_printf(t, "\033[0;90m%*d \033[0m", gutter_w - 1, line_nr);
-            } else {
-                buf_printf(t, "\033[0m%*s", gutter_w, "");
-            }
-            need_sgr_reset = 1;
-        }
-
         buf_printf(t, "\033[%d;%dH", row + 1, content_start);
 
         struct cell *line = NULL;
@@ -1059,14 +1079,6 @@ static void render_terminal(struct ttabmux *t)
         if (thumb_pos < 0) thumb_pos = 0;
         if (thumb_pos + thumb_w > track_w) thumb_pos = track_w - thumb_w;
 
-        /* Gutter area for h-scrollbar row */
-        if (show_linenr) {
-            buf_printf(t, "\033[%d;%dH", hbar_row + 1, sw + 1);
-            buf_append(t, "\033[0m", 4);
-            for (int i = 0; i < gutter_w; i++)
-                buf_append(t, " ", 1);
-        }
-
         buf_printf(t, "\033[%d;%dH", hbar_row + 1, content_start);
         for (int i = 0; i < track_w; i++) {
             if (i >= thumb_pos && i < thumb_pos + thumb_w) {
@@ -1117,8 +1129,8 @@ void render_screen(struct ttabmux *t)
     }
 
     /* Position cursor and show it */
-    if (t->rename_mode) {
-        /* Cursor in the sidebar rename input */
+    if (t->rename_mode || t->wide_mode) {
+        /* Cursor in the sidebar input */
         buf_printf(t, "\033[%d;%dH", t->rename_cursor_row, t->rename_cursor_col);
         buf_append(t, "\033[?25h", 6);
     } else if (t->num_sessions > 0 && !t->show_help && !t->action_mode) {

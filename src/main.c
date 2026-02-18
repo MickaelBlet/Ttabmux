@@ -201,11 +201,16 @@ int session_create(struct ttabmux *t, const char *shell)
 
     /* Wide mode: use wide_cols for PTY column count */
     int vt_cols = pty_cols;
-    if (t->wide_cols > 0)
-        vt_cols = t->wide_cols;
+    if (s->wide_cols > 0)
+        vt_cols = s->wide_cols;
+
+    /* Account for horizontal scrollbar taking one row */
+    int vt_rows = pty_rows;
+    if (vt_cols > pty_cols && vt_rows > 2)
+        vt_rows -= 1;
 
     struct winsize ws = {
-        .ws_row = (unsigned short)pty_rows,
+        .ws_row = (unsigned short)vt_rows,
         .ws_col = (unsigned short)vt_cols,
         .ws_xpixel = 0,
         .ws_ypixel = 0
@@ -246,7 +251,7 @@ int session_create(struct ttabmux *t, const char *shell)
     p0->x = 0;
     p0->y = 0;
     p0->w = pty_cols;
-    p0->h = pty_rows;
+    p0->h = pty_rows;  /* visual height stays full */
     s->num_panes = 1;
     s->active_pane = 0;
 
@@ -277,7 +282,7 @@ int session_create(struct ttabmux *t, const char *shell)
     if (flags >= 0) fcntl(p0->pty_fd, F_SETFL, flags | O_NONBLOCK);
 
     /* Initialize virtual terminal */
-    vterm_init(&p0->vt, pty_rows, vt_cols);
+    vterm_init(&p0->vt, vt_rows, vt_cols);
 
     /* Initialize layout: single leaf node at root */
     memset(s->layout, 0, sizeof(s->layout));
@@ -354,8 +359,17 @@ static void resize_session_panes(struct ttabmux *t, struct session *s)
         if (pty_rows < 2) pty_rows = 2;
 
         /* Wide mode: keep PTY cols at wide_cols, only resize rows */
-        if (t->wide_cols > 0)
-            pty_cols = t->wide_cols;
+        int visible_w = pty_cols;
+        if (s->wide_cols > 0)
+            pty_cols = s->wide_cols;
+
+        /* Account for horizontal scrollbar taking one row */
+        if (pty_cols > visible_w && pty_rows > 2)
+            pty_rows -= 1;
+
+        /* Account for action bar (search/jump) taking one row on active pane */
+        if (t->action_mode && j == s->active_pane && pty_rows > 2)
+            pty_rows -= 1;
 
         if (p->alive && p->pty_fd >= 0) {
             struct winsize ws = {
@@ -417,8 +431,8 @@ static void split_pane(struct ttabmux *t, int split_type, const char *cmd)
 
     /* Wide mode: use wide_cols for PTY column count */
     int vt_cols = cols;
-    if (t->wide_cols > 0)
-        vt_cols = t->wide_cols;
+    if (s->wide_cols > 0)
+        vt_cols = s->wide_cols;
 
     struct winsize ws = {
         .ws_row = (unsigned short)rows,
@@ -729,7 +743,6 @@ static void reap_children(struct ttabmux *t)
 /* action_mode values:
  *   0 = off
  *   1 = search input  (typing query, live search)
- *   2 = jump-to-line  (typing line number)
  *   3 = search nav    (query confirmed; n/N to navigate)
  */
 static void action_mode_start(struct ttabmux *t, int mode)
@@ -739,11 +752,17 @@ static void action_mode_start(struct ttabmux *t, int mode)
     memset(t->action_buf, 0, sizeof(t->action_buf));
     if (mode == 1)
         t->search_match_line = -1;
+    /* Resize active pane to make room for action bar */
+    if (t->num_sessions > 0)
+        resize_session_panes(t, &t->sessions[t->active]);
 }
 
 static void action_mode_end(struct ttabmux *t)
 {
     t->action_mode = 0;
+    /* Restore active pane size after action bar is removed */
+    if (t->num_sessions > 0)
+        resize_session_panes(t, &t->sessions[t->active]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -850,12 +869,32 @@ static void handle_prefix_cmd(struct ttabmux *t, unsigned char ch)
         t->show_help = !t->show_help;
         break;
 
+    case 'w': /* Wide mode toggle */
+        if (t->num_sessions > 0) {
+            struct session *ws = &t->sessions[t->active];
+            if (ws->wide_cols > 0) {
+                /* Toggle OFF */
+                ws->wide_cols = 0;
+                int cw2 = t->term_cols - t->sidebar_width;
+                int ch2 = t->term_rows;
+                if (cw2 < 2) cw2 = 2;
+                if (ch2 < 2) ch2 = 2;
+                layout_reflow(ws, ws->root_node, 0, 0, cw2, ch2);
+                resize_session_panes(t, ws);
+            } else {
+                /* Enter wide input mode */
+                t->wide_mode = 1;
+                t->wide_len = 0;
+                memset(t->wide_buf, 0, sizeof(t->wide_buf));
+            }
+        }
+        break;
+
     case '/': /* Search */
         action_mode_start(t, 1);
         break;
 
-    case 'g': /* Jump to line */
-        action_mode_start(t, 2);
+    case 'g': /* unused */
         break;
 
     case PREFIX_KEY: /* Send literal Ctrl+B to terminal */
@@ -900,6 +939,40 @@ static void handle_rename_input(struct ttabmux *t, unsigned char ch)
         /* Printable character */
         if (t->rename_len < (int)sizeof(t->rename_buf) - 1)
             t->rename_buf[t->rename_len++] = (char)ch;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Handle wide mode input                                            */
+/* ------------------------------------------------------------------ */
+
+static void handle_wide_input(struct ttabmux *t, unsigned char ch)
+{
+    if (ch == '\r' || ch == '\n') {
+        /* Accept the value */
+        if (t->wide_len > 0 && t->active < t->num_sessions) {
+            t->wide_buf[t->wide_len] = '\0';
+            int val = atoi(t->wide_buf);
+            if (val > 0) {
+                struct session *s = &t->sessions[t->active];
+                s->wide_cols = val;
+                int cw = t->term_cols - t->sidebar_width;
+                int ch2 = t->term_rows;
+                if (cw < 2) cw = 2;
+                if (ch2 < 2) ch2 = 2;
+                layout_reflow(s, s->root_node, 0, 0, cw, ch2);
+                resize_session_panes(t, s);
+            }
+        }
+        t->wide_mode = 0;
+    } else if (ch == 0x7F || ch == '\b') {
+        /* Backspace */
+        if (t->wide_len > 0)
+            t->wide_len--;
+    } else if (ch >= '0' && ch <= '9') {
+        /* Digit */
+        if (t->wide_len < (int)sizeof(t->wide_buf) - 1)
+            t->wide_buf[t->wide_len++] = (char)ch;
     }
 }
 
@@ -1013,12 +1086,44 @@ static int search_in_vterm(struct ttabmux *t, const char *query,
             t->search_match_col = (int)(match - linebuf);
             t->search_match_len = (int)strlen(query);
 
+            /* Vertical scroll: center the match */
             int target_offset = vt->sb_len - line + vt->rows / 2;
             if (target_offset > vt->sb_len)
                 target_offset = vt->sb_len;
             if (target_offset < 0)
                 target_offset = 0;
             vt->scroll_offset = target_offset;
+
+            /* Horizontal scroll: ensure match is visible */
+            {
+                struct session *s = &t->sessions[t->active];
+                if (s->wide_cols > 0) {
+                    int visible_w;
+                    if (s->num_panes == 1) {
+                        int gw = pane_gutter_width(p);
+                        int sb = pane_has_scrollbar(p);
+                        visible_w = p->w - gw - sb;
+                    } else {
+                        int sb = pane_has_scrollbar(p);
+                        visible_w = p->w - sb;
+                    }
+                    if (visible_w < 1) visible_w = 1;
+                    int mcol = t->search_match_col;
+                    int mend = mcol + t->search_match_len;
+                    if (mcol < vt->col_offset) {
+                        vt->col_offset = mcol;
+                    } else if (mend > vt->col_offset + visible_w) {
+                        vt->col_offset = mend - visible_w;
+                    }
+                    int max_off = vt->cols - visible_w;
+                    if (max_off < 0) max_off = 0;
+                    if (vt->col_offset > max_off)
+                        vt->col_offset = max_off;
+                    if (vt->col_offset < 0)
+                        vt->col_offset = 0;
+                }
+            }
+
             return 1;
         }
     }
@@ -1068,7 +1173,7 @@ static void search_count_matches(struct ttabmux *t)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Handle action bar input (search / jump-to-line / search nav)      */
+/*  Handle action bar input (search / search nav)                     */
 /* ------------------------------------------------------------------ */
 
 static void handle_action_input(struct ttabmux *t, unsigned char ch)
@@ -1119,34 +1224,6 @@ static void handle_action_input(struct ttabmux *t, unsigned char ch)
                 search_count_matches(t);
             }
         }
-    } else if (t->action_mode == 2) {
-        if (ch == 0x7F || ch == '\b') {
-            if (t->action_len > 0) {
-                t->action_len--;
-                t->action_buf[t->action_len] = '\0';
-            }
-        } else if (ch == '\r' || ch == '\n') {
-            if (t->action_len > 0) {
-                struct pane *p = cur_pane(t);
-                if (p) {
-                    int line_number = atoi(t->action_buf);
-                    struct vterm *vt = &p->vt;
-                    int total_lines = vt->sb_len + vt->rows;
-                    if (line_number < 1) line_number = 1;
-                    if (line_number > total_lines) line_number = total_lines;
-                    int offset = vt->sb_len - (line_number - 1);
-                    if (offset < 0) offset = 0;
-                    if (offset > vt->sb_len) offset = vt->sb_len;
-                    vt->scroll_offset = offset;
-                }
-            }
-            action_mode_end(t);
-        } else if (ch >= '0' && ch <= '9') {
-            if (t->action_len < (int)sizeof(t->action_buf) - 1) {
-                t->action_buf[t->action_len++] = (char)ch;
-                t->action_buf[t->action_len] = '\0';
-            }
-        }
     } else if (t->action_mode == 3) {
         if (ch == 'n') {
             if (t->action_len > 0) {
@@ -1179,16 +1256,10 @@ static void handle_action_input(struct ttabmux *t, unsigned char ch)
 /*  Handle mouse click                                                */
 /* ------------------------------------------------------------------ */
 
-/* Compute line number gutter width for current active pane */
 static int gutter_width(struct ttabmux *t)
 {
-    struct pane *p = cur_pane(t);
-    if (!p) return 0;
-    if (t->num_sessions > 0) {
-        struct session *s = &t->sessions[t->active];
-        if (s->num_panes > 1) return 0;
-    }
-    return pane_gutter_width(p);
+    (void)t;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1525,11 +1596,13 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
             if (region > 3) region = 3;
             btn_hover = 3 + region;  /* 3=split-v, 4=split-h, 5=search, 6=close */
         } else if (row == t->term_rows - 1 && col < t->sidebar_width - 1) {
-            int btn_w = (t->sidebar_width - 1) / 2;
-            if (col < btn_w)
-                btn_hover = 1;
-            else
-                btn_hover = 2;
+            int btn_w = (t->sidebar_width - 1) / 3;
+            int region = col / btn_w;
+            if (region > 2) region = 2;
+            /* region 0=help(1), 1=wide(7), 2=quit(2) */
+            if (region == 0) btn_hover = 1;
+            else if (region == 1) btn_hover = 7;
+            else btn_hover = 2;
         }
         if (btn_hover != t->sidebar_btn_hover)
             t->sidebar_btn_hover = btn_hover;
@@ -1774,13 +1847,13 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
             struct session *ss = &t->sessions[t->active];
 
             /* Check if mouse is on the horizontal scrollbar row */
-            if (t->wide_cols > 0) {
+            if (ss->wide_cols > 0) {
                 int visible_w, hbar_screen_row;
                 if (ss->num_panes == 1) {
                     int gw = pane_gutter_width(p);
                     int sb = pane_has_scrollbar(p);
                     visible_w = p->w - gw - sb;
-                    hbar_screen_row = vt->rows - 1;  /* 0-indexed */
+                    hbar_screen_row = vt->rows;  /* 0-indexed, row after content */
                 } else {
                     int sb = pane_has_scrollbar(p);
                     visible_w = p->w - sb;
@@ -1853,7 +1926,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
     /* Horizontal scroll: button 66 = left, 67 = right
      * Also Shift+scroll: button 68 = shift+up (left), 69 = shift+down (right) */
     if (button == 66 || button == 67 || button == 68 || button == 69) {
-        if (t->wide_cols > 0 && col >= t->sidebar_width) {
+        if (t->num_sessions > 0 && t->sessions[t->active].wide_cols > 0 && col >= t->sidebar_width) {
             int target_idx = find_pane_at(t, col, row);
             struct pane *p;
             if (target_idx >= 0) {
@@ -1926,7 +1999,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
     }
 
     /* Click on horizontal scrollbar row */
-    if (t->wide_cols > 0 && t->num_sessions > 0 && col >= t->sidebar_width) {
+    if (t->num_sessions > 0 && t->sessions[t->active].wide_cols > 0 && col >= t->sidebar_width) {
         struct session *s = &t->sessions[t->active];
         for (int pi2 = 0; pi2 < s->num_panes; pi2++) {
             struct pane *pp = &s->panes[pi2];
@@ -1936,7 +2009,7 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
                 int gw = pane_gutter_width(pp);
                 int sb = pane_has_scrollbar(pp);
                 visible_w = pp->w - gw - sb;
-                hbar_screen_row = vt2->rows - 1;  /* 0-indexed */
+                hbar_screen_row = vt2->rows;  /* 0-indexed, row after content */
                 track_left = t->sidebar_width + gw;
             } else {
                 int sb = pane_has_scrollbar(pp);
@@ -2091,9 +2164,29 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
         }
         /* Bottom button bar */
         if (row == t->term_rows - 1) {
-            int btn_w = (t->sidebar_width - 1) / 2;
-            if (col < btn_w) {
+            int btn_w = (t->sidebar_width - 1) / 3;
+            int region = col / btn_w;
+            if (region > 2) region = 2;
+            if (region == 0) {
                 t->show_help = !t->show_help;
+            } else if (region == 1) {
+                /* Wide mode toggle (same as Ctrl+B w) */
+                if (t->num_sessions > 0) {
+                    struct session *ws = &t->sessions[t->active];
+                    if (ws->wide_cols > 0) {
+                        ws->wide_cols = 0;
+                        int cw2 = t->term_cols - t->sidebar_width;
+                        int ch2 = t->term_rows;
+                        if (cw2 < 2) cw2 = 2;
+                        if (ch2 < 2) ch2 = 2;
+                        layout_reflow(ws, ws->root_node, 0, 0, cw2, ch2);
+                        resize_session_panes(t, ws);
+                    } else {
+                        t->wide_mode = 1;
+                        t->wide_len = 0;
+                        memset(t->wide_buf, 0, sizeof(t->wide_buf));
+                    }
+                }
             } else {
                 t->running = 0;
             }
@@ -2266,9 +2359,15 @@ static void handle_input(struct ttabmux *t, const char *data, int len)
             continue;
         }
 
-        /* Action bar mode (search / jump-to-line / search nav) */
+        /* Action bar mode (search / search nav) */
         if (t->action_mode && t->inp_state == 0 && ch != 0x1B) {
             handle_action_input(t, ch);
+            continue;
+        }
+
+        /* Wide mode input (skip ESC so mouse sequences pass through) */
+        if (t->wide_mode && t->inp_state == 0 && ch != 0x1B) {
+            handle_wide_input(t, ch);
             continue;
         }
 
@@ -2350,6 +2449,11 @@ static void handle_input(struct ttabmux *t, const char *data, int len)
                 t->inp_buf[t->inp_len++] = (char)ch;
                 t->inp_state = 2;
                 t->esc_count = 0;
+            } else if (t->wide_mode) {
+                /* Lone ESC in wide mode: cancel */
+                t->inp_len = 0;
+                t->inp_state = 0;
+                t->wide_mode = 0;
             } else if (t->action_mode) {
                 /* Lone ESC in action mode: cancel search/action */
                 t->inp_len = 0;
@@ -2509,10 +2613,7 @@ static void event_loop(struct ttabmux *t)
             if (n > 0) {
                 debug_pty_output(si, pi, buf, n);
                 /* Track scrollbar changes before processing */
-                int old_gw = 0, old_sb = 0;
-                old_sb = pane_has_scrollbar(p);
-                if (s->num_panes == 1)
-                    old_gw = pane_gutter_width(p);
+                int old_sb = pane_has_scrollbar(p);
 
                 vterm_process(&p->vt, buf, n);
 
@@ -2523,29 +2624,8 @@ static void event_loop(struct ttabmux *t)
                     p->vt.resp_len = 0;
                 }
 
-                /* Resize PTY if gutter/scrollbar width changed */
-                if (t->wide_cols <= 0) {
-                if (s->num_panes == 1) {
-                    int new_gw = pane_gutter_width(p);
-                    int new_sb = pane_has_scrollbar(p);
-                    if (new_gw != old_gw || new_sb != old_sb) {
-                        int pr = p->h;
-                        int pc = p->w - new_gw - new_sb;
-                        if (pr < 2) pr = 2;
-                        if (pc < 2) pc = 2;
-                        struct winsize rws = {
-                            .ws_row = (unsigned short)pr,
-                            .ws_col = (unsigned short)pc,
-                            .ws_xpixel = 0, .ws_ypixel = 0
-                        };
-                        if (p->alive && p->pty_fd >= 0) {
-                            ioctl(p->pty_fd, TIOCSWINSZ, &rws);
-                            kill(p->pid, SIGWINCH);
-                        }
-                        vterm_resize(&p->vt, pr, pc);
-                    }
-                } else {
-                    /* Multi-pane: resize if scrollbar appeared/disappeared */
+                /* Resize PTY if scrollbar appeared/disappeared */
+                if (s->wide_cols <= 0) {
                     int new_sb = pane_has_scrollbar(p);
                     if (new_sb != old_sb) {
                         int pr = p->h;
@@ -2563,7 +2643,6 @@ static void event_loop(struct ttabmux *t)
                         }
                         vterm_resize(&p->vt, pr, pc);
                     }
-                }
                 } /* wide_cols <= 0 */
 
                 /* Update tab name on OSC title change (skip if user renamed) */
@@ -2637,7 +2716,7 @@ static void event_loop(struct ttabmux *t)
 /* ------------------------------------------------------------------ */
 
 #define MAX_STARTUP_ACTIONS 256
-enum startup_action_type { ACT_SESSION, ACT_PROGRAM, ACT_VSPLIT, ACT_HSPLIT, ACT_RENAME };
+enum startup_action_type { ACT_SESSION, ACT_PROGRAM, ACT_VSPLIT, ACT_HSPLIT, ACT_RENAME, ACT_WIDE };
 struct startup_action {
     enum startup_action_type type;
     const char *arg;
@@ -2703,8 +2782,6 @@ int main(int argc, char *argv[])
     struct startup_action actions[MAX_STARTUP_ACTIONS];
     int num_actions = 0;
 
-    int wide_cols = 0;
-
     static struct option long_options[] = {
         {"session", required_argument, NULL, 'S'},
         {"vsplit",  required_argument, NULL, 'V'},
@@ -2727,8 +2804,11 @@ int main(int argc, char *argv[])
             shell = optarg;
             break;
         case 'w':
-            wide_cols = atoi(optarg);
-            if (wide_cols < 0) wide_cols = 0;
+            if (num_actions < MAX_STARTUP_ACTIONS) {
+                actions[num_actions].type = ACT_WIDE;
+                actions[num_actions].arg = optarg;
+                num_actions++;
+            }
             break;
         case 'S':
             if (num_actions < MAX_STARTUP_ACTIONS) {
@@ -2784,7 +2864,6 @@ int main(int argc, char *argv[])
     }
     t->sidebar_width = sidebar_w;
     t->default_shell = shell;
-    t->wide_cols = wide_cols;
     t->running = 1;
     t->split_hover_node = -1;
 
@@ -2848,6 +2927,15 @@ int main(int argc, char *argv[])
                     struct session *s = &t->sessions[t->active];
                     snprintf(s->name, sizeof(s->name), "%s", actions[i].arg);
                     s->renamed = 1;
+                }
+                break;
+            case ACT_WIDE:
+                if (t->num_sessions > 0) {
+                    struct session *s = &t->sessions[t->active];
+                    int wc = atoi(actions[i].arg);
+                    if (wc < 0) wc = 0;
+                    s->wide_cols = wc;
+                    resize_session_panes(t, s);
                 }
                 break;
             }
