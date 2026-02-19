@@ -44,6 +44,7 @@
 
 static volatile sig_atomic_t g_winch = 0;
 static volatile sig_atomic_t g_child = 0;
+static volatile sig_atomic_t g_quit  = 0;
 
 static void handle_sigwinch(int sig)
 {
@@ -55,6 +56,35 @@ static void handle_sigchld(int sig)
 {
     (void)sig;
     g_child = 1;
+}
+
+static void handle_sigquit(int sig)
+{
+    (void)sig;
+    g_quit = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  String pool for config-loaded strings                             */
+/* ------------------------------------------------------------------ */
+
+#define CFG_MAX_STRINGS 256
+static char *cfg_strings[CFG_MAX_STRINGS];
+static int cfg_string_count = 0;
+
+static char *cfg_strdup(const char *s)
+{
+    if (cfg_string_count >= CFG_MAX_STRINGS) return NULL;
+    char *dup = strdup(s);
+    if (dup) cfg_strings[cfg_string_count++] = dup;
+    return dup;
+}
+
+static void cfg_free_strings(void)
+{
+    for (int i = 0; i < cfg_string_count; i++)
+        free(cfg_strings[i]);
+    cfg_string_count = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -185,6 +215,19 @@ static int find_leaf_for_pane(struct session *s, int pane_idx)
 /*  Session / PTY / Pane management                                   */
 /* ------------------------------------------------------------------ */
 
+/* Scroll the sidebar so the active session is visible. */
+static void sidebar_ensure_visible(struct ttabmux *t)
+{
+    int list_rows = t->term_rows - 3; /* mirrors render_sidebar: rows 1..term_rows-2 */
+    if (list_rows < 1) list_rows = 1;
+    if (t->active < t->sidebar_scroll)
+        t->sidebar_scroll = t->active;
+    if (t->active >= t->sidebar_scroll + list_rows)
+        t->sidebar_scroll = t->active - list_rows + 1;
+    if (t->sidebar_scroll < 0)
+        t->sidebar_scroll = 0;
+}
+
 int session_create(struct ttabmux *t, const char *shell)
 {
     if (t->num_sessions >= MAX_SESSIONS) return -1;
@@ -297,6 +340,7 @@ int session_create(struct ttabmux *t, const char *shell)
 
     t->num_sessions++;
     t->active = idx;
+    sidebar_ensure_visible(t);
 
     return idx;
 }
@@ -781,12 +825,14 @@ static void handle_prefix_cmd(struct ttabmux *t, unsigned char ch)
     case 'n': /* Next terminal */
         if (t->num_sessions > 1) {
             t->active = (t->active + 1) % t->num_sessions;
+            sidebar_ensure_visible(t);
         }
         break;
 
     case 'p': /* Previous terminal */
         if (t->num_sessions > 1) {
             t->active = (t->active - 1 + t->num_sessions) % t->num_sessions;
+            sidebar_ensure_visible(t);
         }
         break;
 
@@ -796,6 +842,7 @@ static void handle_prefix_cmd(struct ttabmux *t, unsigned char ch)
             int idx = ch - '1';
             if (idx < t->num_sessions) {
                 t->active = idx;
+                sidebar_ensure_visible(t);
             }
         }
         break;
@@ -1225,7 +1272,7 @@ static void handle_action_input(struct ttabmux *t, unsigned char ch)
             }
         }
     } else if (t->action_mode == 3) {
-        if (ch == 'n') {
+        if (ch == 'n' || ch == '\r' || ch == '\n') {
             if (t->action_len > 0) {
                 int start = t->search_match_line >= 0
                     ? t->search_match_line : 0;
@@ -1573,8 +1620,9 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
         return;
     }
 
-    /* Hover tracking: button 35 = motion with no button (SGR encoding) */
-    if (button == 35) {
+    /* Hover tracking: button 35 = motion with no button (SGR encoding).
+     * Skipped entirely when --no-hover is active (1002 mode). */
+    if (button == 35 && !t->no_hover) {
         int on_border = (col >= t->sidebar_width - 1 && col <= t->sidebar_width);
         if (on_border != t->sidebar_hover) {
             t->sidebar_hover = on_border;
@@ -2128,8 +2176,11 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
             case 1: /* Split Horizontal */
                 split_pane(t, SPLIT_HORIZ, NULL);
                 break;
-            case 2: /* Search */
-                action_mode_start(t, 1);
+            case 2: /* Search: toggle */
+                if (t->action_mode)
+                    action_mode_end(t);
+                else
+                    action_mode_start(t, 1);
                 break;
             case 3: /* Close */
                 if (t->num_sessions > 0) {
@@ -2171,7 +2222,10 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
                 t->show_help = !t->show_help;
             } else if (region == 1) {
                 /* Wide mode toggle (same as Ctrl+B w) */
-                if (t->num_sessions > 0) {
+                if (t->wide_mode) {
+                    /* Cancel pending column prompt */
+                    t->wide_mode = 0;
+                } else if (t->num_sessions > 0) {
                     struct session *ws = &t->sessions[t->active];
                     if (ws->wide_cols > 0) {
                         ws->wide_cols = 0;
@@ -2414,7 +2468,7 @@ static void handle_input(struct ttabmux *t, const char *data, int len)
                 t->inp_len = 1;
                 t->inp_state = 1;
                 t->esc_count++;
-                if (t->esc_count >= 3) {
+                if (t->esc_count >= 10) {
                     t->running = 0;
                     return;
                 }
@@ -2485,6 +2539,7 @@ static void handle_input(struct ttabmux *t, const char *data, int len)
                                 t->active = (t->active - 1 + t->num_sessions) % t->num_sessions;
                             else           /* Ctrl+Down: next session */
                                 t->active = (t->active + 1) % t->num_sessions;
+                            sidebar_ensure_visible(t);
                         }
                     } else {
                         inp_flush(t);
@@ -2527,6 +2582,11 @@ static void event_loop(struct ttabmux *t)
 
     while (t->running) {
         /* Handle pending signals */
+        if (g_quit) {
+            t->running = 0;
+            break;
+        }
+
         if (g_winch) {
             g_winch = 0;
             get_term_size(t);
@@ -2576,7 +2636,12 @@ static void event_loop(struct ttabmux *t)
         /* Lone ESC timeout: if we're waiting for a follow-up byte after ESC
          * and poll returned without stdin data, treat it as a bare ESC press */
         if (t->inp_state == 1 && !(fds[0].revents & POLLIN)) {
-            if (t->action_mode) {
+            if (t->wide_mode) {
+                t->inp_len = 0;
+                t->inp_state = 0;
+                t->wide_mode = 0;
+                need_render = 1;
+            } else if (t->action_mode) {
                 t->inp_len = 0;
                 t->inp_state = 0;
                 t->search_match_line = -1;
@@ -2722,19 +2787,178 @@ struct startup_action {
     const char *arg;
 };
 
+/* Parse a color name or 0-255 number into a 256-color index.
+   Returns -1 on failure. */
+static int parse_color(const char *s)
+{
+    static const char *names[] = {
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+        "bright-black", "bright-red", "bright-green", "bright-yellow",
+        "bright-blue", "bright-magenta", "bright-cyan", "bright-white"
+    };
+    for (int i = 0; i < 16; i++) {
+        if (strcmp(s, names[i]) == 0) return i;
+    }
+    /* "gray"/"grey" alias for bright-black (8) */
+    if (strcmp(s, "gray") == 0 || strcmp(s, "grey") == 0) return 8;
+    /* numeric */
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (*end == '\0' && v >= 0 && v <= 255) return (int)v;
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  INI config file parser                                            */
+/* ------------------------------------------------------------------ */
+
+typedef int (*ini_handler)(const char *section, const char *name,
+                           const char *key, const char *value, void *ud);
+
+static int ini_parse(const char *path, ini_handler handler, void *ud)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    char line[1024];
+    char section[256] = "";
+    char name[256] = "";
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* strip leading whitespace */
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        /* strip trailing whitespace/newline */
+        char *e = p + strlen(p);
+        while (e > p && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'))
+            *--e = '\0';
+        /* skip blank lines and comments */
+        if (*p == '\0' || *p == '#' || *p == ';') continue;
+
+        if (*p == '[') {
+            /* section header: [section] or [section:name] */
+            char *rb = strchr(p, ']');
+            if (!rb) continue;
+            *rb = '\0';
+            p++;
+            char *colon = strchr(p, ':');
+            if (colon) {
+                *colon = '\0';
+                snprintf(section, sizeof(section), "%s", p);
+                snprintf(name, sizeof(name), "%s", colon + 1);
+            } else {
+                snprintf(section, sizeof(section), "%s", p);
+                name[0] = '\0';
+            }
+            continue;
+        }
+
+        /* key = value */
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        /* trim key */
+        char *kend = eq;
+        while (kend > p && (kend[-1] == ' ' || kend[-1] == '\t')) kend--;
+        *kend = '\0';
+        /* trim value */
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+
+        handler(section, name, p, val, ud);
+    }
+    fclose(fp);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Config data and handler                                           */
+/* ------------------------------------------------------------------ */
+
+struct config_data {
+    int sidebar;            /* -1 = not set */
+    const char *shell;      /* NULL = not set */
+    const char *title;      /* NULL = not set */
+    int fg;                 /* -2 = not set, -1 = parse error */
+    int bg;                 /* -2 = not set, -1 = parse error */
+    int no_hover;           /* -1 = not set */
+    struct startup_action actions[MAX_STARTUP_ACTIONS];
+    int num_actions;
+};
+
+static int config_handler(const char *section, const char *name,
+                          const char *key, const char *value, void *ud)
+{
+    struct config_data *cfg = (struct config_data *)ud;
+
+    if (strcmp(section, "settings") == 0) {
+        if (strcmp(key, "sidebar") == 0) {
+            cfg->sidebar = atoi(value);
+        } else if (strcmp(key, "shell") == 0) {
+            cfg->shell = cfg_strdup(value);
+        } else if (strcmp(key, "title") == 0) {
+            cfg->title = cfg_strdup(value);
+        } else if (strcmp(key, "fg") == 0) {
+            cfg->fg = parse_color(value);
+        } else if (strcmp(key, "bg") == 0) {
+            cfg->bg = parse_color(value);
+        } else if (strcmp(key, "no_hover") == 0) {
+            cfg->no_hover = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+        }
+    } else if (strcmp(section, "session") == 0 && name[0] != '\0') {
+        if (strcmp(key, "command") == 0) {
+            /* Start a new session, then rename it */
+            if (cfg->num_actions < MAX_STARTUP_ACTIONS) {
+                cfg->actions[cfg->num_actions].type = ACT_SESSION;
+                cfg->actions[cfg->num_actions].arg = cfg_strdup(value);
+                cfg->num_actions++;
+            }
+            if (cfg->num_actions < MAX_STARTUP_ACTIONS) {
+                cfg->actions[cfg->num_actions].type = ACT_RENAME;
+                cfg->actions[cfg->num_actions].arg = cfg_strdup(name);
+                cfg->num_actions++;
+            }
+        } else if (strcmp(key, "vsplit") == 0) {
+            if (cfg->num_actions < MAX_STARTUP_ACTIONS) {
+                cfg->actions[cfg->num_actions].type = ACT_VSPLIT;
+                cfg->actions[cfg->num_actions].arg = cfg_strdup(value);
+                cfg->num_actions++;
+            }
+        } else if (strcmp(key, "hsplit") == 0) {
+            if (cfg->num_actions < MAX_STARTUP_ACTIONS) {
+                cfg->actions[cfg->num_actions].type = ACT_HSPLIT;
+                cfg->actions[cfg->num_actions].arg = cfg_strdup(value);
+                cfg->num_actions++;
+            }
+        } else if (strcmp(key, "wide") == 0) {
+            if (cfg->num_actions < MAX_STARTUP_ACTIONS) {
+                cfg->actions[cfg->num_actions].type = ACT_WIDE;
+                cfg->actions[cfg->num_actions].arg = cfg_strdup(value);
+                cfg->num_actions++;
+            }
+        }
+    }
+    return 0;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [options] [program ...]\n"
         "\n"
         "Options:\n"
+        "  -c, --config FILE   Load INI config file (default: ~/.config/ttabmux/config.ini)\n"
         "  -s WIDTH          Sidebar width (default: %d)\n"
         "  -e SHELL          Default shell for new tabs (default: $SHELL)\n"
+        "  -M, --no-hover    Disable hover highlights (use 1002 instead of 1003\n"
+        "                    mouse tracking; recommended over SSH)\n"
         "  -S, --session NAME  Create a new session named NAME\n"
         "  -V, --vsplit CMD    Split current pane vertically, run CMD\n"
         "  -H, --hsplit CMD    Split current pane horizontally, run CMD\n"
         "  -w, --wide COLS     Wide mode: PTY columns (enables horizontal scroll)\n"
         "  -r, --rename NAME   Rename the current (last created) session\n"
+        "  -t, --title TITLE   Set the sidebar header title (default: Ttabmux)\n"
+        "  -f, --fg COLOR      Title foreground color (name or 0-255, default: bright-white)\n"
+        "  -b, --bg COLOR      Title background color (name or 0-255, default: blue)\n"
         "  -h, --help          Show this help\n"
         "\n"
         "Options -S, -V, -H, -r are processed left-to-right to build\n"
@@ -2754,7 +2978,7 @@ static void usage(const char *prog)
         "  ?          Show help overlay\n"
         "  Ctrl+B     Send literal Ctrl+B\n"
         "\n"
-        "  ESC x3     Quick quit (press ESC 3 times)\n"
+        "  ESC x10    Quick quit (press ESC 10 times)\n"
         "\n"
         "Examples:\n"
         "  %s htop\n"
@@ -2783,19 +3007,34 @@ int main(int argc, char *argv[])
     int num_actions = 0;
 
     static struct option long_options[] = {
-        {"session", required_argument, NULL, 'S'},
-        {"vsplit",  required_argument, NULL, 'V'},
-        {"hsplit",  required_argument, NULL, 'H'},
-        {"rename",  required_argument, NULL, 'r'},
-        {"wide",    required_argument, NULL, 'w'},
-        {"help",    no_argument,       NULL, 'h'},
+        {"config",   required_argument, NULL, 'c'},
+        {"session",  required_argument, NULL, 'S'},
+        {"vsplit",   required_argument, NULL, 'V'},
+        {"hsplit",   required_argument, NULL, 'H'},
+        {"rename",   required_argument, NULL, 'r'},
+        {"wide",     required_argument, NULL, 'w'},
+        {"title",    required_argument, NULL, 't'},
+        {"fg",       required_argument, NULL, 'f'},
+        {"bg",       required_argument, NULL, 'b'},
+        {"no-hover", no_argument,       NULL, 'M'},
+        {"help",     no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
+    int no_hover = 0;
+    const char *config_path = NULL;
+    const char *app_title_arg = NULL;
+    int title_fg_arg = -1;
+    int title_bg_arg = -1;
+    int sidebar_w_set = 0;
     int opt;
-    while ((opt = getopt_long(argc, argv, "s:e:w:S:V:H:r:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:s:e:t:f:b:w:S:V:H:r:Mh", long_options, NULL)) != -1) {
         switch (opt) {
+        case 'c':
+            config_path = optarg;
+            break;
         case 's':
+            sidebar_w_set = 1;
             sidebar_w = atoi(optarg);
             if (sidebar_w < 25) sidebar_w = 25;
             if (sidebar_w > 60) sidebar_w = 60;
@@ -2838,6 +3077,26 @@ int main(int argc, char *argv[])
                 num_actions++;
             }
             break;
+        case 't':
+            app_title_arg = optarg;
+            break;
+        case 'f':
+            title_fg_arg = parse_color(optarg);
+            if (title_fg_arg < 0) {
+                fprintf(stderr, "Unknown color '%s'. Use a name (e.g. red) or 0-255.\n", optarg);
+                return 1;
+            }
+            break;
+        case 'b':
+            title_bg_arg = parse_color(optarg);
+            if (title_bg_arg < 0) {
+                fprintf(stderr, "Unknown color '%s'. Use a name (e.g. blue) or 0-255.\n", optarg);
+                return 1;
+            }
+            break;
+        case 'M':
+            no_hover = 1;
+            break;
         case 'h':
             usage(argv[0]);
             return 0;
@@ -2854,6 +3113,66 @@ int main(int argc, char *argv[])
         num_actions++;
     }
 
+    /* ---- Load INI config file ---- */
+    struct config_data cfg = { .sidebar = -1, .shell = NULL, .title = NULL,
+                               .fg = -2, .bg = -2, .no_hover = -1,
+                               .num_actions = 0 };
+    {
+        char auto_path[PATH_MAX];
+        int have_config = 0;
+
+        if (config_path) {
+            /* Explicit -c: must exist */
+            if (ini_parse(config_path, config_handler, &cfg) < 0) {
+                fprintf(stderr, "Cannot open config file: %s\n", config_path);
+                cfg_free_strings();
+                return 1;
+            }
+            have_config = 1;
+        } else {
+            /* Auto-detect: XDG_CONFIG_HOME or ~/.config */
+            const char *xdg = getenv("XDG_CONFIG_HOME");
+            if (xdg && xdg[0]) {
+                snprintf(auto_path, sizeof(auto_path),
+                         "%s/ttabmux/config.ini", xdg);
+            } else {
+                const char *home = getenv("HOME");
+                if (home && home[0])
+                    snprintf(auto_path, sizeof(auto_path),
+                             "%s/.config/ttabmux/config.ini", home);
+                else
+                    auto_path[0] = '\0';
+            }
+            if (auto_path[0] && ini_parse(auto_path, config_handler, &cfg) == 0)
+                have_config = 1;
+        }
+
+        if (have_config) {
+            /* Merge global settings: CLI overrides config */
+            if (!sidebar_w_set && cfg.sidebar >= 0) {
+                sidebar_w = cfg.sidebar;
+                if (sidebar_w < 25) sidebar_w = 25;
+                if (sidebar_w > 60) sidebar_w = 60;
+            }
+            if (!shell && cfg.shell)
+                shell = cfg.shell;
+            if (!app_title_arg && cfg.title)
+                app_title_arg = cfg.title;
+            if (title_fg_arg == -1 && cfg.fg != -2)
+                title_fg_arg = cfg.fg;
+            if (title_bg_arg == -1 && cfg.bg != -2)
+                title_bg_arg = cfg.bg;
+            if (!no_hover && cfg.no_hover > 0)
+                no_hover = 1;
+            /* Use config sessions only if CLI specified none */
+            if (num_actions == 0 && cfg.num_actions > 0) {
+                for (int i = 0; i < cfg.num_actions && i < MAX_STARTUP_ACTIONS; i++)
+                    actions[i] = cfg.actions[i];
+                num_actions = cfg.num_actions;
+            }
+        }
+    }
+
     debug_open();
 
     /* Initialize app state on the heap (struct is large with panes) */
@@ -2866,6 +3185,11 @@ int main(int argc, char *argv[])
     t->default_shell = shell;
     t->running = 1;
     t->split_hover_node = -1;
+    t->no_hover = no_hover;
+    snprintf(t->app_title, sizeof(t->app_title), "%s",
+             app_title_arg ? app_title_arg : "Ttabmux");
+    t->title_fg = title_fg_arg;
+    t->title_bg = title_bg_arg;
 
     /* Get terminal size */
     get_term_size(t);
@@ -2896,10 +3220,20 @@ int main(int argc, char *argv[])
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);
 
+    sa.sa_handler = handle_sigquit;
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP,  &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+
     /* Switch to alternate screen buffer */
     IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1049h", 8));
-    /* Enable mouse tracking (X11 button + SGR extended mode) */
-    IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1003h\033[?1006h", 16));
+    /* Enable mouse tracking (SGR extended mode).
+     * 1003 = any-motion (hover); 1002 = button-event-only (no hover). */
+    if (t->no_hover)
+        IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1002h\033[?1006h", 16));
+    else
+        IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1003h\033[?1006h", 16));
     /* Clear screen */
     IGNORE_RESULT(write(STDOUT_FILENO, "\033[2J", 4));
 
@@ -2946,7 +3280,11 @@ int main(int argc, char *argv[])
         session_create(t, shell);
     }
     if (t->num_sessions == 0) {
-        IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1006l\033[?1003l", 16));
+        if (t->no_hover)
+            IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1006l\033[?1002l", 16));
+        else
+            IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1006l\033[?1003l", 16));
+        IGNORE_RESULT(write(STDOUT_FILENO, "\033[0m\033[?25h\033[ q", 13));
         IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1049l", 8));
         term_restore(t);
         fprintf(stderr, "Failed to create terminal session\n");
@@ -2967,8 +3305,13 @@ int main(int argc, char *argv[])
     render_free(t);
 
     /* Disable mouse tracking */
-    IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1006l\033[?1003l", 16));
-    /* Leave alternate screen buffer */
+    if (t->no_hover)
+        IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1006l\033[?1002l", 16));
+    else
+        IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1006l\033[?1003l", 16));
+    /* Reset SGR attributes, show cursor, reset cursor style */
+    IGNORE_RESULT(write(STDOUT_FILENO, "\033[0m\033[?25h\033[ q", 13));
+    /* Leave alternate screen buffer (restores primary screen content) */
     IGNORE_RESULT(write(STDOUT_FILENO, "\033[?1049l", 8));
 
     /* Restore terminal */
@@ -2976,6 +3319,7 @@ int main(int argc, char *argv[])
 
     debug_close();
 
+    cfg_free_strings();
     free(t);
     return 0;
 }

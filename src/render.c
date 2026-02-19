@@ -198,22 +198,28 @@ static void render_sidebar(struct ttabmux *t)
         if (row == 0) {
             /* Title bar with [+] button on the right */
             int has_new = (t->num_sessions < MAX_SESSIONS);
-            const char *title = " Ttabmux";
+            char title_buf[66];
+            snprintf(title_buf, sizeof(title_buf), " %s", t->app_title);
+            const char *title = title_buf;
             int tlen = (int)strlen(title);
             const char *newbtn = "[+]";
             int nblen = has_new ? (int)strlen(newbtn) : 0;
             int fill = sw - 1 - tlen - nblen;
             if (fill < 0) fill = 0;
 
-            buf_append(t, "\033[0m\033[1;97;44m", 15);
+            /* Build title SGR from configured fg/bg (or defaults) */
+            int fg = t->title_fg >= 0 ? t->title_fg : 15; /* bright white */
+            int bg = t->title_bg >= 0 ? t->title_bg :  4; /* blue */
+            buf_append(t, "\033[0m", 4);
+            buf_printf(t, "\033[1;38;5;%d;48;5;%dm", fg, bg);
             buf_append(t, title, tlen < sw - 1 ? tlen : sw - 1);
             for (int c = 0; c < fill; c++)
                 buf_append(t, " ", 1);
             if (has_new) {
                 if (t->sidebar_newbtn_hover)
-                    buf_append(t, "\033[0;1;33;44m", 12); /* bold yellow on blue */
+                    buf_append(t, "\033[0;1;33;40m", 12); /* bold yellow on black */
                 else
-                    buf_append(t, "\033[0;97;44m", 10);   /* white on blue */
+                    buf_append(t, "\033[0;97;40m", 10);   /* white on black */
                 buf_append(t, newbtn, nblen);
             }
             buf_append(t, "\033[0m", 4);
@@ -281,9 +287,15 @@ static void render_sidebar(struct ttabmux *t)
                                         idx + 1,
                                         t->sessions[idx].name);
                     } else {
-                        llen = snprintf(line, sizeof(line), " %s%d: [dead]",
-                                        is_active ? "> " : "  ",
-                                        idx + 1);
+                        const char *dname = t->sessions[idx].name;
+                        if (dname[0])
+                            llen = snprintf(line, sizeof(line), " %s%d: [dead] - %s",
+                                            is_active ? "> " : "  ",
+                                            idx + 1, dname);
+                        else
+                            llen = snprintf(line, sizeof(line), " %s%d: [dead]",
+                                            is_active ? "> " : "  ",
+                                            idx + 1);
                     }
 
                     if (llen > content_w) llen = content_w;
@@ -294,9 +306,10 @@ static void render_sidebar(struct ttabmux *t)
                 }
             } else {
                 /* Empty slot */
-                buf_append(t, "\033[0m", 4);
+                buf_append(t, "\033[0;40m", 7);
                 for (int c = 0; c < content_w; c++)
                     buf_append(t, " ", 1);
+                buf_append(t, "\033[0m", 4);
             }
 
             /* Scrollbar or padding before border */
@@ -315,9 +328,9 @@ static void render_sidebar(struct ttabmux *t)
 
             /* Split Vertical button */
             if (t->sidebar_btn_hover == 3)
-                buf_append(t, "\033[0;1;32;40m", 12);  /* bold green */
+                buf_append(t, "\033[0;1;32;40m", 12);  /* bold green on black */
             else
-                buf_append(t, "\033[0;90m", 7);         /* dim gray */
+                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
             {
                 const char *lbl = " V| ";
                 int llen = (int)strlen(lbl);
@@ -331,9 +344,9 @@ static void render_sidebar(struct ttabmux *t)
 
             /* Split Horizontal button */
             if (t->sidebar_btn_hover == 4)
-                buf_append(t, "\033[0;1;32;40m", 12);  /* bold green */
+                buf_append(t, "\033[0;1;32;40m", 12);  /* bold green on black */
             else
-                buf_append(t, "\033[0;90m", 7);         /* dim gray */
+                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
             {
                 int printed = 0;
                 buf_append(t, " H", 2); printed += 2;
@@ -347,9 +360,9 @@ static void render_sidebar(struct ttabmux *t)
 
             /* Search button */
             if (t->sidebar_btn_hover == 5)
-                buf_append(t, "\033[0;1;33;40m", 12);  /* bold yellow */
+                buf_append(t, "\033[0;1;33;40m", 12);  /* bold yellow on black */
             else
-                buf_append(t, "\033[0;90m", 7);         /* dim gray */
+                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
             {
                 const char *lbl = "  / ";
                 int llen = (int)strlen(lbl);
@@ -364,9 +377,9 @@ static void render_sidebar(struct ttabmux *t)
             /* Close button (gets remainder) */
             int btn_w4 = (sw - 1) - used;
             if (t->sidebar_btn_hover == 6)
-                buf_append(t, "\033[0;1;31;40m", 12);  /* bold red */
+                buf_append(t, "\033[0;1;31;40m", 12);  /* bold red on black */
             else
-                buf_append(t, "\033[0;90m", 7);         /* dim gray */
+                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
             {
                 const char *lbl = "  X ";
                 int llen = (int)strlen(lbl);
@@ -387,7 +400,7 @@ static void render_sidebar(struct ttabmux *t)
             if (t->sidebar_btn_hover == 1)
                 buf_append(t, "\033[0;1;36;40m", 12);  /* bold cyan on black */
             else
-                buf_append(t, "\033[0;90m", 7);         /* dim gray */
+                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
             {
                 const char *lbl = " ? Help";
                 int llen = (int)strlen(lbl);
@@ -404,11 +417,11 @@ static void render_sidebar(struct ttabmux *t)
                 int wide_active = (t->num_sessions > 0 &&
                                    t->sessions[t->active].wide_cols > 0);
                 if (t->sidebar_btn_hover == 7)
-                    buf_append(t, "\033[0;1;35;40m", 12);  /* bold magenta */
+                    buf_append(t, "\033[0;1;35;40m", 12);  /* bold magenta on black */
                 else if (wide_active)
-                    buf_append(t, "\033[0;1;36;40m", 12);  /* bold cyan */
+                    buf_append(t, "\033[0;1;36;40m", 12);  /* bold cyan on black */
                 else
-                    buf_append(t, "\033[0;90m", 7);         /* dim gray */
+                    buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
                 const char *lbl = " W Wide";
                 int llen = (int)strlen(lbl);
                 if (llen > btn_w) llen = btn_w;
@@ -424,7 +437,7 @@ static void render_sidebar(struct ttabmux *t)
             if (t->sidebar_btn_hover == 2)
                 buf_append(t, "\033[0;1;31;40m", 12);  /* bold red on black */
             else
-                buf_append(t, "\033[0;90m", 7);         /* dim gray */
+                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
             {
                 const char *lbl = " x Quit";
                 int llen = (int)strlen(lbl);
@@ -438,9 +451,10 @@ static void render_sidebar(struct ttabmux *t)
             buf_append(t, bdr_vert, bdr_vert_len);
         } else {
             /* Empty sidebar row */
-            buf_append(t, "\033[0m", 4);
+            buf_append(t, "\033[0;40m", 7);
             for (int c = 0; c < sw - 1; c++)
                 buf_append(t, " ", 1);
+            buf_append(t, "\033[0m", 4);
             buf_append(t, bdr_vert, bdr_vert_len);
         }
     }
@@ -463,22 +477,15 @@ static void render_help(struct ttabmux *t)
         "",
         "  Prefix key: Ctrl+B",
         "",
-        "  c       Create new terminal",
-        "  n       Next terminal",
-        "  p       Previous terminal",
-        "  1-9     Switch to terminal N",
-        "  x       Close current pane/tab",
-        "  v       Vertical split",
-        "  s       Horizontal split",
-        "  o       Cycle pane focus",
-        "  Arrows  Navigate panes",
-        "  ,       Rename current terminal",
-        "  w       Toggle wide mode",
-        "  /       Search (n/N to navigate)",
-        "  d       Detach (quit)",
-        "  ?       Toggle this help",
+        "  c    Create new terminal     | x       Close current pane/tab",
+        "  n    Next terminal           | v       Vertical split",
+        "  p    Previous terminal       | s       Horizontal split",
+        "  1-9  Switch to terminal N    | o       Cycle pane focus",
+        "  ,    Rename current terminal | Arrows  Navigate panes",
+        "  d    Detach (quit)           | w       Toggle wide mode",
+        "  ?    Toggle this help        | /       Search (n/N to navigate)",
         "",
-        "  ESC x3  Quick quit",
+        "  ESC x10 Quick quit",
         "",
         "  Press any key to close help",
         NULL

@@ -147,6 +147,9 @@ struct ttabmux {
     int active;
     int sidebar_width;
     int term_rows, term_cols;
+    char app_title[64];         /* sidebar header title (default: "Ttabmux") */
+    int title_fg;               /* title fg 256-color index, -1 = default (bright white) */
+    int title_bg;               /* title bg 256-color index, -1 = default (blue) */
     struct termios orig_termios;
     int running;
     int prefix_mode;
@@ -171,6 +174,8 @@ struct ttabmux {
     int search_match_len;    /* length of match in cells */
     int search_match_index;  /* 1-based index of current match */
     int search_match_total;  /* total number of matches */
+    /* Hover suppression (--no-hover / -M): use 1002 instead of 1003 */
+    int no_hover;
     /* Sidebar drag resize */
     int sidebar_drag;
     int sidebar_hover;      /* mouse is on the resize border */
