@@ -2780,7 +2780,7 @@ static void event_loop(struct ttabmux *t)
 /*  Startup action types for CLI argument processing                  */
 /* ------------------------------------------------------------------ */
 
-#define MAX_STARTUP_ACTIONS 256
+#define MAX_STARTUP_ACTIONS 1024
 enum startup_action_type { ACT_SESSION, ACT_PROGRAM, ACT_VSPLIT, ACT_HSPLIT, ACT_RENAME, ACT_WIDE };
 struct startup_action {
     enum startup_action_type type;
@@ -2917,6 +2917,12 @@ static int config_handler(const char *section, const char *name,
                 cfg->actions[cfg->num_actions].arg = cfg_strdup(name);
                 cfg->num_actions++;
             }
+        } else if (strcmp(key, "rename") == 0) {
+            if (cfg->num_actions < MAX_STARTUP_ACTIONS) {
+                cfg->actions[cfg->num_actions].type = ACT_RENAME;
+                cfg->actions[cfg->num_actions].arg = cfg_strdup(value);
+                cfg->num_actions++;
+            }
         } else if (strcmp(key, "vsplit") == 0) {
             if (cfg->num_actions < MAX_STARTUP_ACTIONS) {
                 cfg->actions[cfg->num_actions].type = ACT_VSPLIT;
@@ -2999,6 +3005,8 @@ static void usage(const char *prog)
 int main(int argc, char *argv[])
 {
     setlocale(LC_ALL, "");
+
+    debug_open();
 
     const char *shell = NULL;
     int sidebar_w = SIDEBAR_WIDTH;
@@ -3173,8 +3181,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    debug_open();
-
     /* Initialize app state on the heap (struct is large with panes) */
     struct ttabmux *t = calloc(1, sizeof(*t));
     if (!t) {
@@ -3259,8 +3265,13 @@ int main(int argc, char *argv[])
             case ACT_RENAME:
                 if (t->num_sessions > 0) {
                     struct session *s = &t->sessions[t->active];
-                    snprintf(s->name, sizeof(s->name), "%s", actions[i].arg);
-                    s->renamed = 1;
+                    if (actions[i].arg[0] != '\0') {
+                        snprintf(s->name, sizeof(s->name), "%s", actions[i].arg);
+                        s->renamed = 1;
+                    }
+                    else {
+                        s->renamed = 0;
+                    }
                 }
                 break;
             case ACT_WIDE:
