@@ -813,6 +813,8 @@ static void action_mode_end(struct ttabmux *t)
 /*  Handle prefix key commands                                        */
 /* ------------------------------------------------------------------ */
 
+static void pane_write_all(struct ttabmux *t, const char *data, int len);
+
 static void handle_prefix_cmd(struct ttabmux *t, unsigned char ch)
 {
     t->prefix_mode = 0;
@@ -944,12 +946,19 @@ static void handle_prefix_cmd(struct ttabmux *t, unsigned char ch)
     case 'g': /* unused */
         break;
 
-    case PREFIX_KEY: /* Send literal Ctrl+B to terminal */
+    case 'm': /* Toggle multicursor (broadcast input to all panes) */
+        t->multicursor = !t->multicursor;
+        break;
+
+    case PREFIX_KEY: /* Send literal Ctrl+B to terminal (or all panes) */
         {
-            struct pane *p = cur_pane(t);
-            if (p && p->alive) {
-                char c = PREFIX_KEY;
-                IGNORE_RESULT(write(p->pty_fd, &c, 1));
+            char c = PREFIX_KEY;
+            if (t->multicursor)
+                pane_write_all(t, &c, 1);
+            else {
+                struct pane *p = cur_pane(t);
+                if (p && p->alive)
+                    IGNORE_RESULT(write(p->pty_fd, &c, 1));
             }
         }
         break;
@@ -1551,6 +1560,69 @@ static void clear_selection(struct ttabmux *t)
     t->sel_dragging = 0;
 }
 
+static void paste_primary(struct ttabmux *t)
+{
+    struct pane *p = cur_pane(t);
+    if (!p || !p->alive) return;
+
+    /* Detect WSL once: skip X11/Wayland tools and go straight to PowerShell */
+    static int wsl = -1;
+    if (wsl == -1)
+        wsl = (access("/proc/sys/fs/binfmt_misc/WSLInterop", F_OK) == 0) ? 1 : 0;
+
+    char text[16384];
+    int tlen = 0;
+
+    if (!wsl) {
+        /* Native Linux: try X11 / Wayland clipboard tools */
+        static const char *cmds[] = {
+            "xclip -o -selection primary 2>/dev/null",
+            "xsel -o -p 2>/dev/null",
+            "wl-paste --primary --no-newline 2>/dev/null",
+            "wl-paste --no-newline 2>/dev/null",
+            NULL
+        };
+        for (int i = 0; cmds[i] && tlen == 0; i++) {
+            FILE *fp = popen(cmds[i], "r");
+            if (!fp) continue;
+            tlen = (int)fread(text, 1, sizeof(text), fp);
+            pclose(fp);
+        }
+    }
+
+    /* WSL (or Linux fallback): read via Windows PowerShell.
+     * -NoProfile -NonInteractive skips profile loading, cutting startup time. */
+    if (tlen == 0) {
+        FILE *fp = popen(
+            "powershell.exe -NoProfile -NonInteractive -command \"Get-Clipboard\" 2>/dev/null",
+            "r");
+        if (fp) {
+            tlen = (int)fread(text, 1, sizeof(text), fp);
+            pclose(fp);
+        }
+    }
+
+    if (tlen <= 0) return;
+
+    /* Strip \r to handle Windows line endings from powershell.exe */
+    int out = 0;
+    for (int i = 0; i < tlen; i++) {
+        if (text[i] != '\r')
+            text[out++] = text[i];
+    }
+    tlen = out;
+    /* Strip trailing newline added by powershell.exe */
+    if (tlen > 0 && text[tlen - 1] == '\n')
+        tlen--;
+    if (tlen <= 0) return;
+
+    if (p->vt.bracketed_paste)
+        IGNORE_RESULT(write(p->pty_fd, "\033[200~", 6));
+    IGNORE_RESULT(write(p->pty_fd, text, (size_t)tlen));
+    if (p->vt.bracketed_paste)
+        IGNORE_RESULT(write(p->pty_fd, "\033[201~", 6));
+}
+
 static void handle_mouse(struct ttabmux *t, int button, int col, int row,
                          int is_press)
 {
@@ -1644,12 +1716,13 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
             if (region > 3) region = 3;
             btn_hover = 3 + region;  /* 3=split-v, 4=split-h, 5=search, 6=close */
         } else if (row == t->term_rows - 1 && col < t->sidebar_width - 1) {
-            int btn_w = (t->sidebar_width - 1) / 3;
+            int btn_w = (t->sidebar_width - 1) / 4;
             int region = col / btn_w;
-            if (region > 2) region = 2;
-            /* region 0=help(1), 1=wide(7), 2=quit(2) */
-            if (region == 0) btn_hover = 1;
+            if (region > 3) region = 3;
+            /* region 0=multicursor(8), 1=wide(7), 2=help(1), 3=quit(2) */
+            if (region == 0) btn_hover = 8;
             else if (region == 1) btn_hover = 7;
+            else if (region == 2) btn_hover = 1;
             else btn_hover = 2;
         }
         if (btn_hover != t->sidebar_btn_hover)
@@ -2018,6 +2091,19 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
         return;
     }
 
+    /* Middle click: paste primary selection (when child isn't tracking mouse) */
+    if (button == 1 && col >= t->sidebar_width) {
+        struct pane *p = cur_pane(t);
+        if (p) {
+            debug_log("Alive: %i, MouseMode: %i, ScollOffset: %i", p->alive, p->vt.mouse_mode, p->vt.scroll_offset);
+            if (p->alive && !p->vt.mouse_mode) {
+                paste_primary(t);
+                return;
+            }
+        }
+        /* Child has mouse tracking — fall through and forward the event */
+    }
+
     /* Non-left-click buttons: forward to child if it has mouse tracking */
     if (button != 0) {
         if (col >= t->sidebar_width && t->num_sessions > 0) {
@@ -2215,11 +2301,12 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
         }
         /* Bottom button bar */
         if (row == t->term_rows - 1) {
-            int btn_w = (t->sidebar_width - 1) / 3;
+            int btn_w = (t->sidebar_width - 1) / 4;
             int region = col / btn_w;
-            if (region > 2) region = 2;
+            if (region > 3) region = 3;
             if (region == 0) {
-                t->show_help = !t->show_help;
+                /* Multicursor toggle (same as Ctrl+B m) */
+                t->multicursor = !t->multicursor;
             } else if (region == 1) {
                 /* Wide mode toggle (same as Ctrl+B w) */
                 if (t->wide_mode) {
@@ -2241,6 +2328,8 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
                         memset(t->wide_buf, 0, sizeof(t->wide_buf));
                     }
                 }
+            } else if (region == 2) {
+                t->show_help = !t->show_help;
             } else {
                 t->running = 0;
             }
@@ -2362,14 +2451,34 @@ static void handle_mouse(struct ttabmux *t, int button, int col, int row,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Flush input escape buffer to active PTY                           */
+/*  Write data to all alive panes in the current session              */
+/* ------------------------------------------------------------------ */
+
+static void pane_write_all(struct ttabmux *t, const char *data, int len)
+{
+    if (t->num_sessions == 0 || len <= 0) return;
+    struct session *s = &t->sessions[t->active];
+    for (int i = 0; i < s->num_panes; i++) {
+        struct pane *p = &s->panes[i];
+        if (p->alive)
+            IGNORE_RESULT(write(p->pty_fd, data, (size_t)len));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Flush input escape buffer to active PTY (or all panes)            */
 /* ------------------------------------------------------------------ */
 
 static void inp_flush(struct ttabmux *t)
 {
-    struct pane *p = cur_pane(t);
-    if (t->inp_len > 0 && p && p->alive) {
-        IGNORE_RESULT(write(p->pty_fd, t->inp_buf, (size_t)t->inp_len));
+    if (t->inp_len > 0) {
+        if (t->multicursor)
+            pane_write_all(t, t->inp_buf, t->inp_len);
+        else {
+            struct pane *p = cur_pane(t);
+            if (p && p->alive)
+                IGNORE_RESULT(write(p->pty_fd, t->inp_buf, (size_t)t->inp_len));
+        }
     }
     t->inp_len = 0;
     t->inp_state = 0;
@@ -2477,23 +2586,38 @@ static void handle_input(struct ttabmux *t, const char *data, int len)
                 t->esc_count = 0;
             } else {
                 t->esc_count = 0;
-                struct pane *p = cur_pane(t);
-                if (p && p->alive) {
-                    int remaining = len - i;
-                    int chunk = 0;
-                    while (chunk < remaining) {
-                        unsigned char b = (unsigned char)data[i + chunk];
-                        if (b == PREFIX_KEY || b == 0x1B)
-                            break;
-                        chunk++;
+                /* Measure the plain-text chunk (stop at PREFIX_KEY / ESC) */
+                int remaining = len - i;
+                int chunk = 0;
+                while (chunk < remaining) {
+                    unsigned char b = (unsigned char)data[i + chunk];
+                    if (b == PREFIX_KEY || b == 0x1B)
+                        break;
+                    chunk++;
+                }
+                if (chunk > 0) {
+                    if (t->sel_active)
+                        clear_selection(t);
+                    if (t->multicursor) {
+                        /* Send to every alive pane in this session */
+                        if (t->num_sessions > 0) {
+                            struct session *s = &t->sessions[t->active];
+                            for (int pi = 0; pi < s->num_panes; pi++) {
+                                struct pane *pp = &s->panes[pi];
+                                if (pp->alive) {
+                                    pp->vt.scroll_offset = 0;
+                                    IGNORE_RESULT(write(pp->pty_fd, data + i, (size_t)chunk));
+                                }
+                            }
+                        }
+                    } else {
+                        struct pane *p = cur_pane(t);
+                        if (p && p->alive) {
+                            p->vt.scroll_offset = 0;
+                            IGNORE_RESULT(write(p->pty_fd, data + i, (size_t)chunk));
+                        }
                     }
-                    if (chunk > 0) {
-                        if (t->sel_active)
-                            clear_selection(t);
-                        p->vt.scroll_offset = 0;
-                        IGNORE_RESULT(write(p->pty_fd, data + i, (size_t)chunk));
-                        i += chunk - 1;
-                    }
+                    i += chunk - 1;
                 }
             }
             break;
@@ -2781,11 +2905,129 @@ static void event_loop(struct ttabmux *t)
 /* ------------------------------------------------------------------ */
 
 #define MAX_STARTUP_ACTIONS 1024
-enum startup_action_type { ACT_SESSION, ACT_PROGRAM, ACT_VSPLIT, ACT_HSPLIT, ACT_RENAME, ACT_WIDE };
+enum startup_action_type { ACT_SESSION, ACT_PROGRAM, ACT_VSPLIT, ACT_HSPLIT, ACT_RENAME, ACT_WIDE, ACT_PLACE };
 struct startup_action {
     enum startup_action_type type;
     const char *arg;
 };
+
+/* ------------------------------------------------------------------ */
+/*  Grid placement helper                                             */
+/* ------------------------------------------------------------------ */
+
+/* Maximum row/col index allowed in --place (grid bounded by MAX_PANES) */
+#define MAX_PLACE_DIM (MAX_PANES - 1)
+
+struct place_entry {
+    int row, col;
+    const char *cmd;
+};
+
+static int place_entry_cmp(const void *a, const void *b)
+{
+    const struct place_entry *pa = a, *pb = b;
+    if (pa->row != pb->row) return pa->row - pb->row;
+    return pa->col - pb->col;
+}
+
+/*
+ * Build a grid of panes from a list of ACT_PLACE actions.
+ * arg format: "ROW,COL[,CMD]"
+ *
+ * Algorithm (column-first, row-second ordering):
+ *   (0,0)        -> session_create
+ *   (0,c) c>0   -> vsplit from pane at (0, c-1)
+ *   (r,c) r>0   -> hsplit from pane at (r-1, c)
+ *
+ * If (0,0) is absent the current active session's pane 0 is used as
+ * the origin, so --place can extend a session created by -S.
+ */
+static void process_place_group(struct ttabmux *t, const char *shell,
+                                struct startup_action *acts, int n)
+{
+    if (n == 0) return;
+
+    struct place_entry entries[MAX_STARTUP_ACTIONS];
+    int n_entries = 0;
+
+    for (int i = 0; i < n; i++) {
+        const char *p = acts[i].arg;
+        char *end;
+        long row = strtol(p, &end, 10);
+        if (end == p || row < 0 || row > MAX_PLACE_DIM) continue;
+        p = end;
+        if (*p == ',') p++;
+        long col = strtol(p, &end, 10);
+        if (end == p || col < 0 || col > MAX_PLACE_DIM) continue;
+        p = end;
+        if (*p == ',') p++;
+        const char *cmd = *p ? p : NULL;
+        entries[n_entries].row = (int)row;
+        entries[n_entries].col = (int)col;
+        entries[n_entries].cmd = cmd;
+        n_entries++;
+    }
+
+    if (n_entries == 0) return;
+
+    qsort(entries, n_entries, sizeof(entries[0]), place_entry_cmp);
+
+    /* pane_map[row][col] = pane index within session, -1 = not created */
+    int pane_map[MAX_PLACE_DIM + 1][MAX_PLACE_DIM + 1];
+    for (int r = 0; r <= MAX_PLACE_DIM; r++)
+        for (int c = 0; c <= MAX_PLACE_DIM; c++)
+            pane_map[r][c] = -1;
+
+    /* If (0,0) not in entries, anchor to the current session's pane 0 */
+    int has_origin = 0;
+    for (int i = 0; i < n_entries; i++)
+        if (entries[i].row == 0 && entries[i].col == 0) { has_origin = 1; break; }
+    if (!has_origin && t->num_sessions > 0)
+        pane_map[0][0] = 0;
+
+    for (int i = 0; i < n_entries; i++) {
+        int row = entries[i].row;
+        int col = entries[i].col;
+        const char *cmd = entries[i].cmd ? entries[i].cmd : shell;
+
+        if (row == 0 && col == 0) {
+            if (session_create(t, cmd) < 0) return;
+            pane_map[0][0] = t->sessions[t->active].active_pane;
+        } else {
+            if (t->num_sessions == 0) {
+                fprintf(stderr, "ttabmux: place(%d,%d): no session — add place(0,0,...) first\n",
+                        row, col);
+                continue;
+            }
+            struct session *s = &t->sessions[t->active];
+            if (row == 0) {
+                int parent = pane_map[0][col - 1];
+                if (parent < 0) {
+                    fprintf(stderr, "ttabmux: place(0,%d): predecessor (0,%d) missing\n",
+                            col, col - 1);
+                    continue;
+                }
+                s->active_pane = parent;
+                split_pane(t, SPLIT_VERT, cmd);
+                pane_map[0][col] = s->active_pane;
+            } else {
+                int parent = pane_map[row - 1][col];
+                if (parent < 0) {
+                    fprintf(stderr, "ttabmux: place(%d,%d): predecessor (%d,%d) missing\n",
+                            row, col, row - 1, col);
+                    continue;
+                }
+                s->active_pane = parent;
+                split_pane(t, SPLIT_HORIZ, cmd);
+                pane_map[row][col] = s->active_pane;
+            }
+        }
+    }
+
+    /* Leave focus on pane (0,0) */
+    if (t->num_sessions > 0 && pane_map[0][0] >= 0)
+        t->sessions[t->active].active_pane = pane_map[0][0];
+}
 
 /* Parse a color name or 0-255 number into a 256-color index.
    Returns -1 on failure. */
@@ -2941,6 +3183,12 @@ static int config_handler(const char *section, const char *name,
                 cfg->actions[cfg->num_actions].arg = cfg_strdup(value);
                 cfg->num_actions++;
             }
+        } else if (strcmp(key, "place") == 0) {
+            if (cfg->num_actions < MAX_STARTUP_ACTIONS) {
+                cfg->actions[cfg->num_actions].type = ACT_PLACE;
+                cfg->actions[cfg->num_actions].arg = cfg_strdup(value);
+                cfg->num_actions++;
+            }
         }
     }
     return 0;
@@ -2962,6 +3210,10 @@ static void usage(const char *prog)
         "  -H, --hsplit CMD    Split current pane horizontally, run CMD\n"
         "  -w, --wide COLS     Wide mode: PTY columns (enables horizontal scroll)\n"
         "  -r, --rename NAME   Rename the current (last created) session\n"
+        "  -P, --place R,C[,CMD]  Place a pane at grid row R, column C\n"
+        "                         Multiple -P options build a 2-D grid layout.\n"
+        "                         R=0,C=0 creates a new session; other R,C values\n"
+        "                         split the current session automatically.\n"
         "  -t, --title TITLE   Set the sidebar header title (default: Ttabmux)\n"
         "  -f, --fg COLOR      Title foreground color (name or 0-255, default: bright-white)\n"
         "  -b, --bg COLOR      Title background color (name or 0-255, default: blue)\n"
@@ -2994,8 +3246,18 @@ static void usage(const char *prog)
         "    Create session \"dev\" with 3 panes (shell + vim vsplit + make hsplit)\n"
         "\n"
         "  %s -S logs -V 'tail -f /var/log/syslog' -S build -r build make\n"
-        "    Two sessions: \"logs\" with a vertical split, and \"build\" running make\n",
-        prog, SIDEBAR_WIDTH, prog, prog, prog);
+        "    Two sessions: \"logs\" with a vertical split, and \"build\" running make\n"
+        "\n"
+        "  %s -P 0,0,vim -P 0,1,htop -P 1,0,make -P 1,1\n"
+        "    One session with a 2x2 grid: vim top-left, htop top-right,\n"
+        "    make bottom-left, shell bottom-right\n"
+        "\n"
+        "Config file (place = ROW,COL[,CMD] in [session:NAME] section):\n"
+        "  [session:dev]\n"
+        "  place = 0,0,vim\n"
+        "  place = 0,1,htop\n"
+        "  place = 1,0,make\n",
+        prog, SIDEBAR_WIDTH, prog, prog, prog, prog);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3021,6 +3283,7 @@ int main(int argc, char *argv[])
         {"hsplit",   required_argument, NULL, 'H'},
         {"rename",   required_argument, NULL, 'r'},
         {"wide",     required_argument, NULL, 'w'},
+        {"place",    required_argument, NULL, 'P'},
         {"title",    required_argument, NULL, 't'},
         {"fg",       required_argument, NULL, 'f'},
         {"bg",       required_argument, NULL, 'b'},
@@ -3036,7 +3299,7 @@ int main(int argc, char *argv[])
     int title_bg_arg = -1;
     int sidebar_w_set = 0;
     int opt;
-    while ((opt = getopt_long(argc, argv, "c:s:e:t:f:b:w:S:V:H:r:Mh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:s:e:t:f:b:w:S:V:H:r:P:Mh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'c':
             config_path = optarg;
@@ -3081,6 +3344,13 @@ int main(int argc, char *argv[])
         case 'r':
             if (num_actions < MAX_STARTUP_ACTIONS) {
                 actions[num_actions].type = ACT_RENAME;
+                actions[num_actions].arg = optarg;
+                num_actions++;
+            }
+            break;
+        case 'P':
+            if (num_actions < MAX_STARTUP_ACTIONS) {
+                actions[num_actions].type = ACT_PLACE;
                 actions[num_actions].arg = optarg;
                 num_actions++;
             }
@@ -3283,6 +3553,33 @@ int main(int argc, char *argv[])
                     resize_session_panes(t, s);
                 }
                 break;
+            case ACT_PLACE: {
+                /* Collect all consecutive ACT_PLACE actions into a group.
+                 * A second (0,0) entry starts the next session group. */
+                int j = i + 1;
+                int seen_origin = 0;
+                {
+                    const char *p = actions[i].arg;
+                    char *ep;
+                    long r = strtol(p, &ep, 10);
+                    p = ep; if (*p == ',') p++;
+                    long c = strtol(p, &ep, 10);
+                    if (r == 0 && c == 0) seen_origin = 1;
+                }
+                while (j < num_actions && actions[j].type == ACT_PLACE) {
+                    const char *p = actions[j].arg;
+                    char *ep;
+                    long r = strtol(p, &ep, 10);
+                    p = ep; if (*p == ',') p++;
+                    long c = strtol(p, &ep, 10);
+                    if (r == 0 && c == 0 && seen_origin) break; /* next session */
+                    if (r == 0 && c == 0) seen_origin = 1;
+                    j++;
+                }
+                process_place_group(t, shell, &actions[i], j - i);
+                i = j - 1; /* loop will i++ */
+                break;
+            }
             }
         }
         if (t->num_sessions > 0)

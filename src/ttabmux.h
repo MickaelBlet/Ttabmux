@@ -184,6 +184,8 @@ struct ttabmux {
     int sidebar_sb_drag;    /* dragging the sidebar scrollbar */
     /* Scrollbar drag */
     int scrollbar_drag;
+    /* Multicursor: broadcast input to all panes in the current session */
+    int multicursor;
     /* Horizontal scrollbar drag */
     int hscrollbar_drag;
     int hscrollbar_drag_pane;   /* pane index being dragged */
@@ -192,7 +194,7 @@ struct ttabmux {
     int split_drag_node;
     int split_drag_x, split_drag_y, split_drag_w, split_drag_h;
     int split_hover_node;    /* layout node of hovered divider, -1 = none */
-    /* Sidebar bottom button hover: 0=none, 1=help, 2=quit, 3=split-v, 4=split-h, 5=search, 6=close */
+    /* Sidebar bottom button hover: 0=none, 1=help, 2=quit, 3=split-v, 4=split-h, 5=search, 6=close, 7=wide, 8=multicursor */
     int sidebar_btn_hover;
     /* Sidebar [+] new tab button hover */
     int sidebar_newbtn_hover;

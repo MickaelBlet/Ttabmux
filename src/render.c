@@ -196,7 +196,7 @@ static void render_sidebar(struct ttabmux *t)
         buf_printf(t, "\033[%d;1H", row + 1);
 
         if (row == 0) {
-            /* Title bar with [+] button on the right */
+            /* Title bar with optional [+] button */
             int has_new = (t->num_sessions < MAX_SESSIONS);
             char title_buf[66];
             snprintf(title_buf, sizeof(title_buf), " %s", t->app_title);
@@ -328,9 +328,9 @@ static void render_sidebar(struct ttabmux *t)
 
             /* Split Vertical button */
             if (t->sidebar_btn_hover == 3)
-                buf_append(t, "\033[0;1;32;40m", 12);  /* bold green on black */
+                buf_append(t, "\033[0;1;92;48;5;22m", 17);  /* bright green on dark green */
             else
-                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
+                buf_append(t, "\033[0;37;48;5;236m", 16);   /* gray on charcoal */
             {
                 const char *lbl = " V| ";
                 int llen = (int)strlen(lbl);
@@ -344,9 +344,9 @@ static void render_sidebar(struct ttabmux *t)
 
             /* Split Horizontal button */
             if (t->sidebar_btn_hover == 4)
-                buf_append(t, "\033[0;1;32;40m", 12);  /* bold green on black */
+                buf_append(t, "\033[0;1;92;48;5;22m", 17);  /* bright green on dark green */
             else
-                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
+                buf_append(t, "\033[0;37;48;5;239m", 16);   /* gray on charcoal */
             {
                 int printed = 0;
                 buf_append(t, " H", 2); printed += 2;
@@ -360,11 +360,11 @@ static void render_sidebar(struct ttabmux *t)
 
             /* Search button */
             if (t->sidebar_btn_hover == 5)
-                buf_append(t, "\033[0;1;33;40m", 12);  /* bold yellow on black */
+                buf_append(t, "\033[0;1;93;48;5;94m", 17);  /* bright yellow on olive */
             else
-                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
+                buf_append(t, "\033[0;37;48;5;236m", 16);   /* gray on charcoal */
             {
-                const char *lbl = "  / ";
+                const char *lbl = "  /  ";
                 int llen = (int)strlen(lbl);
                 if (llen > btn_w) llen = btn_w;
                 buf_append(t, lbl, llen);
@@ -377,11 +377,11 @@ static void render_sidebar(struct ttabmux *t)
             /* Close button (gets remainder) */
             int btn_w4 = (sw - 1) - used;
             if (t->sidebar_btn_hover == 6)
-                buf_append(t, "\033[0;1;31;40m", 12);  /* bold red on black */
+                buf_append(t, "\033[0;1;91;48;5;52m", 17);  /* bright red on dark red */
             else
-                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
+                buf_append(t, "\033[0;37;48;5;239m", 16);   /* gray on charcoal */
             {
-                const char *lbl = "  X ";
+                const char *lbl = "  X  ";
                 int llen = (int)strlen(lbl);
                 if (llen > btn_w4) llen = btn_w4;
                 buf_append(t, lbl, llen);
@@ -392,17 +392,19 @@ static void render_sidebar(struct ttabmux *t)
 
             buf_append(t, bdr_vert, bdr_vert_len);
         } else if (row == t->term_rows - 1) {
-            /* Bottom button bar: [Help] [Wide] [Quit] */
-            int btn_w = (sw - 1) / 3;
+            /* Bottom button bar: [MC] [Wide] [Help] [Quit] */
+            int btn_w = (sw - 1) / 4;
             int used = 0;
 
-            /* Help button */
-            if (t->sidebar_btn_hover == 1)
-                buf_append(t, "\033[0;1;36;40m", 12);  /* bold cyan on black */
-            else
-                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
+            /* Multicursor button */
             {
-                const char *lbl = " ? Help";
+                if (t->sidebar_btn_hover == 8)
+                    buf_append(t, "\033[0;1;95;48;5;53m", 17);  /* bright magenta on dark purple (hover) */
+                else if (t->multicursor)
+                    buf_append(t, "\033[0;1;97;48;5;88m", 17);  /* white on dark red (active) */
+                else
+                    buf_append(t, "\033[0;37;48;5;239m", 16);   /* gray on charcoal */
+                const char *lbl = " m MC";
                 int llen = (int)strlen(lbl);
                 if (llen > btn_w) llen = btn_w;
                 buf_append(t, lbl, llen);
@@ -417,11 +419,11 @@ static void render_sidebar(struct ttabmux *t)
                 int wide_active = (t->num_sessions > 0 &&
                                    t->sessions[t->active].wide_cols > 0);
                 if (t->sidebar_btn_hover == 7)
-                    buf_append(t, "\033[0;1;35;40m", 12);  /* bold magenta on black */
+                    buf_append(t, "\033[0;1;96;48;5;17m", 17);  /* bright cyan on dark blue (hover) */
                 else if (wide_active)
-                    buf_append(t, "\033[0;1;36;40m", 12);  /* bold cyan on black */
+                    buf_append(t, "\033[0;1;97;48;5;24m", 17);  /* white on dark blue (active) */
                 else
-                    buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
+                    buf_append(t, "\033[0;37;48;5;236m", 16);   /* gray on charcoal */
                 const char *lbl = " W Wide";
                 int llen = (int)strlen(lbl);
                 if (llen > btn_w) llen = btn_w;
@@ -432,18 +434,34 @@ static void render_sidebar(struct ttabmux *t)
             used += btn_w;
             buf_append(t, "\033[0m", 4);
 
-            /* Quit button (gets remainder) */
-            int btn_w3 = (sw - 1) - used;
-            if (t->sidebar_btn_hover == 2)
-                buf_append(t, "\033[0;1;31;40m", 12);  /* bold red on black */
+            /* Help button */
+            if (t->sidebar_btn_hover == 1)
+                buf_append(t, "\033[0;1;96;48;5;17m", 17);  /* bright cyan on dark blue (hover) */
             else
-                buf_append(t, "\033[0;90;40m", 10);     /* dim gray on black */
+                buf_append(t, "\033[0;37;48;5;239m", 16);   /* gray on charcoal */
+            {
+                const char *lbl = " ? Help";
+                int llen = (int)strlen(lbl);
+                if (llen > btn_w) llen = btn_w;
+                buf_append(t, lbl, llen);
+                for (int c = llen; c < btn_w; c++)
+                    buf_append(t, " ", 1);
+            }
+            used += btn_w;
+            buf_append(t, "\033[0m", 4);
+
+            /* Quit button (gets remainder) */
+            int btn_w4 = (sw - 1) - used;
+            if (t->sidebar_btn_hover == 2)
+                buf_append(t, "\033[0;1;91;48;5;52m", 17);  /* bright red on dark red (hover) */
+            else
+                buf_append(t, "\033[0;37;48;5;236m", 16);   /* gray on charcoal */
             {
                 const char *lbl = " x Quit";
                 int llen = (int)strlen(lbl);
-                if (llen > btn_w3) llen = btn_w3;
+                if (llen > btn_w4) llen = btn_w4;
                 buf_append(t, lbl, llen);
-                for (int c = llen; c < btn_w3; c++)
+                for (int c = llen; c < btn_w4; c++)
                     buf_append(t, " ", 1);
             }
             buf_append(t, "\033[0m", 4);
@@ -484,6 +502,7 @@ static void render_help(struct ttabmux *t)
         "  ,    Rename current terminal | Arrows  Navigate panes",
         "  d    Detach (quit)           | w       Toggle wide mode",
         "  ?    Toggle this help        | /       Search (n/N to navigate)",
+        "  m    Toggle multicursor      | (input sent to ALL panes)",
         "",
         "  ESC x10 Quick quit",
         "",
@@ -1108,6 +1127,56 @@ static void render_terminal(struct ttabmux *t)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Multicursor fake-cursor overlay                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * When multicursor mode is active, draw a visible cursor marker at the
+ * cursor position of every non-active pane in the current session.
+ * The real (hardware) cursor remains on the active pane.
+ */
+static void render_multicursors(struct ttabmux *t)
+{
+    if (!t->multicursor || t->num_sessions == 0 || t->show_help) return;
+
+    struct session *s = &t->sessions[t->active];
+    int sw = t->sidebar_width;
+
+    for (int pi = 0; pi < s->num_panes; pi++) {
+        if (pi == s->active_pane) continue;
+
+        struct pane *p = &s->panes[pi];
+        if (!p->alive) continue;
+
+        struct vterm *vt = &p->vt;
+        if (!vt->cursor_visible || vt->scroll_offset != 0) continue;
+        if (vt->cursor_row < 0 || vt->cursor_row >= vt->rows) continue;
+
+        int visible_col = vt->cursor_col - vt->col_offset;
+        int sb = pane_has_scrollbar(p);
+        int vis_w = p->w - sb;
+        if (visible_col < 0 || visible_col >= vis_w) continue;
+
+        int screen_row = p->y + vt->cursor_row + 1;
+        int screen_col = sw + p->x + visible_col + 1;
+
+        /* Fetch the character already at this cell */
+        struct cell *c = vterm_cell(vt, vt->cursor_row, vt->cursor_col);
+
+        buf_printf(t, "\033[%d;%dH", screen_row, screen_col);
+        buf_append(t, "\033[0;1;97;45m", 12); /* bold white on magenta */
+        if (c && c->ch > 0x20) {
+            char utf8[4];
+            int n = encode_utf8(c->ch, utf8);
+            buf_append(t, utf8, n);
+        } else {
+            buf_append(t, " ", 1);
+        }
+        buf_append(t, "\033[0m", 4);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main render function                                              */
 /* ------------------------------------------------------------------ */
 
@@ -1131,6 +1200,7 @@ void render_screen(struct ttabmux *t)
         render_help(t);
     } else {
         render_terminal(t);
+        render_multicursors(t);
         if (t->action_mode)
             render_action_bar(t);
     }
